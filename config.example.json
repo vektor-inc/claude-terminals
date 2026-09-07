@@ -5,6 +5,7 @@
   "apiRequireAuthAlways": false,
   "initialCommand": "",
   "confirmClose": "busy",
+  "terminalLinkClickMode": "click",
   "gpu": "off",
   "agentroom": false,
   "_waitingExcludeCwdPatternsNote": "ペインの cwdFull に部分一致した場合、ローカル PTY 出力からの waiting 判定対象外にします。",

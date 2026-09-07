@@ -124,6 +124,95 @@ const PANE_DROP_DEADZONE = 0.2;
 let terminals = {};    // paneId -> { termId, term, fitAddon, element, cwd, cwdFull, waiting, status, runningTimer, lastLines, ... }
 let focusedPaneId = null;
 let dragState = null;
+// ペイン内 URL の最初のクリックがフォーカス移動だけだったかどうかの判定に使う
+// （issue #385）。paneId -> 「今回の mousedown でフォーカスが切り替わる直前、その
+// ペインが既にフォーカス済みだったか」の boolean。.pane / .stash-item 要素の mousedown
+// ハンドラ（focusPane() を呼ぶ直前、recordPaneFocusBeforeMousedown() 経由）で記録し、
+// その後の mouseup で発火する xterm.js の activate（createTerminalLinkHandlers の
+// wasPaneFocused 依存関数）から参照する。記録タイミングの理由は
+// utils/terminalLinkPolicy.js の createTerminalLinkHandlers 冒頭コメント参照。
+// closePane() で該当エントリを削除する。
+const paneFocusBeforeMousedown = new Map();
+
+// ウィンドウが blur から復帰した直後の最初の mousedown かどうか（issue #385 レビュー
+// 指摘・MEDIUM-5）。別アプリから VK Terminals をクリックして前面に出すとき、その
+// クリックがたまたまフォーカス済みペインの URL 上に落ちるとブラウザが開いてしまう
+// （修飾キー必須のときは起きなかった事故）。window の blur で pendingWindowRefocusClick
+// を立て、次の mousedown（document の capture フェーズ。xterm.js 側の内部リスナーより
+// 必ず先に発火する。理由は下の document.addEventListener 呼び出しのコメント参照）で
+// isPostWindowBlurMousedown へ確定させてからフラグを消費する。
+// recordPaneFocusBeforeMousedown() はこの値が true のときフォーカス状態を強制的に
+// false 扱いにする（＝フォーカス移動だけの操作とみなし、リンクは開かせない）。
+//
+// 【設計メモ・崩さないこと】この仕組みは「blur で印を立て、次の mousedown で消費する」
+// 形でなければ成立しない。「focus イベントで印を消す」形に直すと、クリックでウィンドウを
+// 前面化する場合は OS ネイティブの focus イベントの方が mousedown より先に飛ぶため
+// （フォーカス移動が先に確定してからアプリ側に mousedown が届く）、印を立てる暇なく
+// 消えてしまい、ガードが丸ごと効かなくなる（レビュー指摘・MEDIUM-5 の補足）。
+//
+// 【レビュー指摘・LOW-B】既定値を false にしていると、アプリがバックグラウンド起動
+// （最初からウィンドウが前面に無い状態）した場合は blur が一度も飛ばないため、
+// 前面に出すための最初のクリックが通常のクリック扱いになってしまう。それが起動時に
+// 自動フォーカスされる最初のペイン（initApp() 参照）の URL 上に落ちると開く。
+// 起動時点で document がフォーカスを持っていなければ、最初から「復帰クリック待ち」
+// 状態で始める。
+let pendingWindowRefocusClick = !document.hasFocus();
+let isPostWindowBlurMousedown = false;
+
+// URL のドラッグ選択判定用の状態（issue #385 レビュー指摘・HIGH-2）。xterm.js の
+// Linkifier は mousedown 時点のリンクと mouseup 時点のリンクが一致するだけで activate
+// を呼び、ポインタの移動量や選択の有無は一切見ない。これは「別々のリンクをまたぐ
+// ドラッグ」だけでなく「同一リンクの中をなぞって選択する（＝ URL をコピーしようと
+// する）」操作も満たしてしまうため、mousedown → mouseup の移動距離を自前で計測し、
+// createTerminalLinkHandlers の wasDragged() 依存関数へ渡す（詳細は
+// utils/terminalLinkPolicy.js の同依存関数の説明コメント参照）。
+//
+// しきい値は 4px。多くのブラウザ・OS の GUI ツールキットが「クリックとドラッグ開始」を
+// 区別するのに使う一般的な目安（WebKit の DragController の既定しきい値に近い値）で、
+// 実測に基づく厳密な最適値ではない。閾値を超えたのに実際は静止したままのクリックだった
+// 場合の実害は「まれにクリックし直しが要る」程度で小さく、逆に閾値を大きくしすぎて
+// ドラッグをクリック扱いしてしまう実害（誤って外部ブラウザが開く）の方が大きいため、
+// 小さめ（＝ドラッグ判定側に倒れやすい）の値をあえて選んでいる。
+//
+// なぜ term.hasSelection() ではなく移動距離で判定するのか（レビュー指摘・LOW-A の
+// 訂正版。詳しい理由づけは utils/terminalLinkPolicy.js の wasDragged() 依存関数の
+// 説明コメント参照）: hasSelection() は xterm.js 内部の選択実装（将来変わりうる非公開の
+// 詳細）に依存するのに対し、移動距離は自前の document capture リスナーだけで完結し
+// xterm.js の内部実装に一切依存しない。距離計算そのもの（isDragDistance()）は
+// utils/terminalLinkPolicy.js の純粋関数へ切り出し、ユニットテストで固定している
+// （安藤の案・レビュー指摘・MEDIUM-B）。
+const TERM_LINK_DRAG_THRESHOLD_PX = 4;
+let lastMousedownClientPos = null;
+let lastClickWasDrag = false;
+
+// document への capture フェーズのリスナーにするのは、xterm.js 側のリスナー
+// （ターミナルの描画要素＝ document の子孫へ登録される）より必ず先に発火させるため。
+// capture フェーズは document → 子孫の順（上から下）へ完全に進み終えてから bubble
+// フェーズが始まるため、document の capture リスナーは子孫側の登録順・登録タイミングに
+// かかわらず常に先に走る（paneFocusBeforeMousedown の記録に使っている .pane /
+// .stash-item の mousedown ハンドラと同じ考え方）。
+document.addEventListener('mousedown', (event) => {
+  lastMousedownClientPos = { x: event.clientX, y: event.clientY };
+  isPostWindowBlurMousedown = pendingWindowRefocusClick;
+  pendingWindowRefocusClick = false;
+}, true);
+document.addEventListener('mouseup', (event) => {
+  lastClickWasDrag = isDragDistance(
+    lastMousedownClientPos,
+    { x: event.clientX, y: event.clientY },
+    TERM_LINK_DRAG_THRESHOLD_PX
+  );
+}, true);
+
+// .pane（グリッド）・.stash-item（格納・サイドバー）のどちらの mousedown からも
+// 必ずこのヘルパー経由で記録する（issue #385 レビュー指摘・MEDIUM-1）。格納ペインの
+// xterm 要素は render() の再アタッチで .stash-item .term-container へ移されて生きた
+// まま操作でき、リンクプロバイダも登録済みのままなので、.pane 側でしか記録しないと
+// 格納ペインでガードが機能しない（またはその逆）。
+function recordPaneFocusBeforeMousedown(paneId) {
+  const wasFocused = isPostWindowBlurMousedown ? false : (focusedPaneId === paneId);
+  paneFocusBeforeMousedown.set(paneId, wasFocused);
+}
 
 // status 判定で使う閾値（ms）。
 //   - RUNNING_IDLE_TIMEOUT_MS: 最後の PTY 出力から何 ms 経ったら idle に戻すか
@@ -147,6 +236,10 @@ let newPaneAutoLaunchClaude = false;
 // ペインを閉じる時の確認（issue #184）。'never' | 'busy' | 'always'（既定 'busy'）。
 // 値は起動時に main（app:get-config）から取得する。設定反映には再起動が必要（設定パネルの note 参照）。
 let confirmClosePref = 'busy';
+// ペイン内 URL のクリック挙動（issue #385）。'click'（既定・単クリックで開く） |
+// 'modifier'（従来どおり ⌘/Ctrl+クリックが必要）。
+// 値は起動時に main（app:get-config）から取得する。設定反映には再起動が必要（設定パネルの note 参照）。
+let terminalLinkClickModePref = 'click';
 let waitingExcludeCwdPatterns = [];
 let commandsConfigured = false;
 // 宣言的ウィジェットの中継ペイロード { widget, legacyNotice, commandsConfigured }。
@@ -520,7 +613,7 @@ async function createTerminal(paneId, cwd, options = {}) {
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
 
-  // ペイン内 URL の Cmd/Ctrl+クリック対応（issue #349）。破棄は term.dispose() 側に
+  // ペイン内 URL のクリック対応（issue #349 → #385）。破棄は term.dispose() 側に
   // 任せる（xterm.js 本体の LinkProviderService は Terminal の disposal 時に登録済み
   // プロバイダを自動でクリアするため、fitAddon 同様ここで個別に dispose() を呼ぶ必要は無い）。
   // isMac は明示的に IS_MAC_PLATFORM を渡す（安藤レビュー指摘・LOW）。省略すると
@@ -528,11 +621,23 @@ async function createTerminal(paneId, cwd, options = {}) {
   // ツールチップの文言（TERM_LINK_MODIFIER_LABEL）はキャッシュ済みの IS_MAC_PLATFORM を
   // 使っており、「実際に見ている修飾キー」と「表示している修飾キー」の判定元が
   // 2 箇所に分かれてしまう。値は実行中変わらないため実害は無いが、出所を 1 本化する。
+  // openUrl は openExternalUrlSafe を直接ではなく openTerminalLinkUrl 経由で渡す
+  // （開いた直後の「開きました」トーストを橋渡しするラッパー。開く経路自体は増やしていない）。
+  // getClickMode は実行時に terminalLinkClickModePref（生きたグローバル変数）を読む関数で
+  // 渡す。ツールチップ文言（termLinkTooltipMessage）も同じ変数を実行時に読んでおり、
+  // 参照経路を1本化するため、生成時点の固定値スナップショットは渡さない
+  // （レビュー指摘・LOW-2）。wasPaneFocused / wasDragged はこの paneId に閉じたクロージャで、
+  // それぞれ paneFocusBeforeMousedown（.pane / .stash-item の mousedown ハンドラが記録）・
+  // lastClickWasDrag（document の mousedown/mouseup capture リスナーが記録）を参照する
+  // （issue #385）。
   term.registerLinkProvider(createTerminalLinkProvider(term, createTerminalLinkHandlers({
-    openUrl: openExternalUrlSafe,
+    openUrl: openTerminalLinkUrl,
     showTooltip: showTermLinkTooltip,
     hideTooltip: hideTermLinkTooltip,
     isMac: IS_MAC_PLATFORM,
+    getClickMode: () => terminalLinkClickModePref,
+    wasPaneFocused: () => paneFocusBeforeMousedown.get(paneId) === true,
+    wasDragged: () => lastClickWasDrag,
   })));
 
   // OSC 0 / OSC 2 のタイトル変更を購読してペイン上部のタスクタイトル行に反映する。
@@ -829,7 +934,11 @@ function isSafeExternalUrl(url) {
 // 少なくとも「ページ先頭から」の距離を一定に保つ（クリック位置からの距離そのものを
 // 短縮する手段は、出現時にフォーカスを奪わない制約の中では無い）。
 //
-// 成功時は何も出さない（ブラウザが実際に開くこと自体がフィードバックのため）。
+// 成功時は基本的に何も出さない（ブラウザが実際に開くこと自体がフィードバックのため）。
+// 例外はペイン内 URL クリック（openTerminalLinkUrl 経由）で、issue #385 でこの同じ
+// トースト基盤を再利用して遷移先ホスト名を知らせる「◯◯ を開きました」を出すように
+// なった（showTerminalLinkOpenedToast 参照）。それ以外の呼び出し元（サイドバーメニュー
+// 等）は従来どおり成功時に何も出さない。
 let externalUrlToastLayerEl = null; // document.body 直下へ挿入する外側コンテナ（pointer-events: none）
 let externalUrlToastEl = null; // 実際に見える箱（pointer-events: auto）。中身の差し替えはこちらへ行う
 let externalUrlToastDismissTimer = null;
@@ -910,9 +1019,11 @@ function ensureExternalUrlToast() {
   const layer = document.createElement('div');
   layer.className = 'vk-toast-layer';
   // document.body 直下だと確認ダイアログ（.confirm-overlay / .confirm-modal）より
-  // 前面に来る（z-index 2200 > 2100）。外側コンテナは pointer-events: none にし、
-  // 実際に見える箱（.vk-toast）だけへ pointer-events: auto を戻すことで、トーストの
-  // 表示領域以外がダイアログのクリックを吸わないようにする（安藤レビュー指摘・高）。
+  // 前面に来る（z-index 2200 > 2100）。外側コンテナは常に pointer-events: none にし、
+  // トーストの表示領域以外がダイアログのクリックを吸わないようにする（安藤レビュー
+  // 指摘・高）。実際に見える箱（.vk-toast）側の pointer-events は固定 auto ではなく、
+  // コピーボタンの有無（操作できる部品があるか）に応じて動的に切り替える
+  // （setExternalUrlToastInteractive 参照。issue #385 レビュー指摘）。
   // focusTrap.js の applyInert が body 直下の子へ inert を付けて回るため、この要素は
   // その対象から除外してもらう目印を付ける（同ファイル参照）。
   layer.setAttribute('data-vk-inert-exempt', '');
@@ -978,6 +1089,28 @@ function ensureExternalUrlToast() {
   return toast;
 }
 
+// トースト内に操作できる部品（コピーボタン）があるかどうかで、トースト自身の
+// pointer-events を切り替える（issue #385 レビュー指摘。麗美の e2e で発見）。
+//
+// issue #385 でリンクを開くたびに毎回「◯◯ を開きました」トーストを出すようになった
+// 結果、従来は「開けなかったとき」など稀にしか出なかった .vk-toast の露出が桁違いに
+// 増えた。.vk-toast は pointer-events: auto（コピーボタンを押せるようにするため）かつ
+// 画面右下に最大 EXTERNAL_URL_TOAST_AUTO_DISMISS_MS（5秒）居座るため、そこにたまたま
+// 別の URL が重なっていると、リンクを開いた直後にその URL をクリックしてもトーストに
+// 吸われてターミナルへ届かず「クリックしても何も起きない」という、この PR が改善
+// しようとしている操作そのものを壊す不具合になっていた（実測で document.elementFromPoint
+// がターミナルではなくトースト内の要素を返すことを確認済み）。
+//
+// 対処方針は .term-link-tooltip と同じ（renderer/style.css の同要素のコメント参照）:
+// 操作できる部品が無いときは pointer-events: none にしてクリックを下（ターミナル）へ
+// 素通りさせる。コピーボタンを持つ失敗トースト（showExternalUrlOpenFailedToast）は
+// ボタンが押せなくなるため対象外とし、常時 pointer-events: auto のままにする。
+// トーストの箱を固定で none にはせず、CSS クラス（.vk-toast--interactive）の有無で
+// 都度切り替える。新しいトースト実装は増やさない（既存の .vk-toast インフラを流用）。
+function setExternalUrlToastInteractive(toast, interactive) {
+  toast.classList.toggle('vk-toast--interactive', interactive);
+}
+
 // 外部ブラウザを開けなかったときに呼ぶ。同時発生時は積み上げず、前のトーストを
 // 新しい内容で上書きする（積み上げると読み上げが渋滞するため）。
 // 出現時にフォーカスは奪わない（操作中の要素にフォーカスを残す）。
@@ -986,6 +1119,9 @@ function showExternalUrlOpenFailedToast(url) {
   if (!toast) return;
   const copyButton = toast.querySelector('.vk-toast-copy');
   if (copyButton) copyButton.hidden = false;
+  // コピーボタンを持つため、クリックを透過させない（上の setExternalUrlToastInteractive
+  // のコメント参照）。
+  setExternalUrlToastInteractive(toast, true);
   externalUrlToastCopyUrl = url;
   setExternalUrlToastMessage(EXTERNAL_URL_TOAST_FAILED_MESSAGE);
   toast.hidden = false;
@@ -993,14 +1129,18 @@ function showExternalUrlOpenFailedToast(url) {
 }
 
 // コピー対象を伴わない汎用メッセージ用（issue #380: 設定コンテンツテーブルの一括切り替え
-// 結果の要約など）。同じ .vk-toast インフラ（issue #326）を再利用し、URL コピー専用の
-// ボタンだけ隠す。「呼び出し箇所ごとに吹き出しを出さない」という汎用トーストの設計方針
-// （冒頭コメント参照）どおり、新しいトースト実装を増やさない。
+// 結果の要約、issue #385: ペイン内 URL クリックの「開きました」など）。同じ .vk-toast
+// インフラ（issue #326）を再利用し、URL コピー専用のボタンだけ隠す。「呼び出し箇所ごとに
+// 吹き出しを出さない」という汎用トーストの設計方針（冒頭コメント参照）どおり、新しい
+// トースト実装は増やさない。
 function showGenericToast(message) {
   const toast = ensureExternalUrlToast();
   if (!toast) return;
   const copyButton = toast.querySelector('.vk-toast-copy');
   if (copyButton) copyButton.hidden = true;
+  // 操作できる部品が無いため、クリックを下（ターミナル等）へ透過させる（上の
+  // setExternalUrlToastInteractive のコメント参照。issue #385 レビュー指摘）。
+  setExternalUrlToastInteractive(toast, false);
   externalUrlToastCopyUrl = '';
   setExternalUrlToastMessage(message);
   toast.hidden = false;
@@ -1014,8 +1154,24 @@ function showGenericToast(message) {
 // ままだとコピー対象の URL がずれる（開けなかった URL と別の URL が残る）ため、
 // 成功時は表示中のトーストを消す（安藤レビュー指摘・中）。
 // click ハンドラ用に preventDefault / stopPropagation 済みである前提。
-function openExternalUrlSafe(url) {
+//
+// options.onSuccess: 成功時に hideExternalUrlToast() の後に呼ぶ任意のコールバック
+// （issue #385）。ペイン内 URL クリック（openTerminalLinkUrl）専用の「開きました」トースト
+// 表示に使う。他の呼び出し元（サイドバーメニュー等）は指定しないため挙動は変わらない。
+//
+// 【内部専用・レビュー指摘・LOW-1】この関数は ensureWidgetViewController()（本ファイル
+// 内。widgetView.js へ渡す openUrl 依存の生成元）や widgetView.js の wireExternalLink()
+// のように、汎用の 1 引数コールバック
+// openUrl(url) としても複数箇所へ配られている。それらの呼び出し元は現状すべて
+// openUrl(url) の 1 引数でしか呼んでいないため実害は無いが、options はあくまで
+// openTerminalLinkUrl() からの内部専用の呼び出し規約であり、汎用の openUrl(url)
+// コールバック契約の一部ではない。将来どこかの呼び出し元が第2引数を forward するよう
+// 変更すると、意図しない onSuccess が意図しない場面で発火しうる。第2引数を追加で
+// 使いたくなったら、こちらを直接拡張せず openTerminalLinkUrl() のような専用ラッパーを
+// 増やすこと。
+function openExternalUrlSafe(url, options = {}) {
   if (!isSafeExternalUrl(url)) return;
+  const onSuccess = typeof options.onSuccess === 'function' ? options.onSuccess : null;
   try {
     // 戻り値は Promise（成否の boolean）。reject 時にハンドラがないと unhandled rejection に
     // なるため明示的にハンドリングする。同期 throw もありうるので try/catch でも包む。
@@ -1024,6 +1180,7 @@ function openExternalUrlSafe(url) {
       p.then((ok) => {
         if (ok === true) {
           hideExternalUrlToast();
+          if (onSuccess) onSuccess();
         } else {
           showExternalUrlOpenFailedToast(url);
         }
@@ -1036,27 +1193,65 @@ function openExternalUrlSafe(url) {
   }
 }
 
-// ─── ペイン内 URL の Cmd/Ctrl+クリック（issue #349） ───────────────────────────────
+// ─── ペイン内 URL のクリックで開く（issue #349 → #385） ───────────────────────────
 // URL の検出・バッファ範囲への変換は renderer/terminalLinkProvider.js（xterm.js の
 // registerLinkProvider を自前実装したもの）が担い、ここでは「どう開くか」
-// （修飾キー判定・ツールチップ表示）だけを扱う。実際に開く経路は openExternalUrlSafe を
-// そのまま使う（新しい経路を増やさない。植草の確定仕様）。
+// （クリック判定・ツールチップ表示・トースト表示）だけを扱う。実際に開く経路は
+// openExternalUrlSafe をそのまま使う（新しい経路を増やさない。植草の確定仕様）。
 //
-// 単クリックでは開かない仕様にしているのは、ターミナルのドラッグ選択との誤爆を防ぐため
-// （植草の UX レビュー・issue #349）。xterm.js 側の Linkifier は mousedown 時点のリンクと
-// mouseup 時点のリンクが一致したときだけ activate を呼ぶため、ドラッグ選択とは元々
-// 衝突しない（xterm.js 本体の src/browser/Linkifier.ts で確認済み）。また矩形選択の
-// 修飾キーは Alt（xterm.js 本体の SelectionService.shouldColumnSelect）であり、
-// ここで使う Cmd（macOS）/ Ctrl（Windows・Linux）とは別のキーのため競合しない。
+// 元々（issue #349）は単クリックでは開かず、Cmd（macOS）/ Ctrl（Windows・Linux）+
+// クリックのときだけ開く仕様だった（ターミナルのドラッグ選択との誤爆を防ぐ狙い）。
+// issue #385（オーナー本人の要望）で「修飾キー無しの単クリックで開く」を既定へ変更し、
+// 従来の修飾キー必須挙動は設定（terminalLinkClickModePref）で選べるようにした。
 //
-// 修飾キー判定（isMacPlatform / isLinkOpenModifierPressed / createTerminalLinkHandlers）
-// は utils/terminalLinkPolicy.js の UMD へ切り出してある。この機能で最もセキュリティに
-// 効く分岐（単クリックだけでは絶対に外部 URL を開かせない）を renderer/app.js の
-// 非エクスポート関数のままにせず、tests/terminalLinkPolicy.test.js から直接ユニット
-// テストできるようにするため（安藤レビュー指摘・MEDIUM）。
-const { isMacPlatform, createTerminalLinkHandlers } = window.VKTerminalLinkPolicy;
+// 【訂正・レビュー指摘 HIGH-2】この段落には以前「xterm.js 側の Linkifier は mousedown
+// 時点のリンクと mouseup 時点のリンクが一致したときだけ activate を呼ぶため、単クリック
+// にしてもドラッグ選択とは元々衝突しない」という記述があったが、これは誤り。この一致
+// 条件は「別々のリンクをまたぐドラッグ」は確かに弾くが、「同一リンクの中だけをなぞって
+// 選択する」操作（＝ URL をコピーしようとする典型的な操作）は mousedown 時のリンクと
+// mouseup 時のリンクが同じ 1 個のリンクのままなので、この条件を普通に満たしてしまう。
+// つまり URL をコピーしようとドラッグしただけでブラウザが開いてしまう（#349 で植草が
+// 避けたかった誤爆そのもの）。この誤った前提のまま実装を進めたのが今回のレビューで
+// 見つかった穴（HIGH-2）で、mousedown → mouseup の移動量を自前で計測する
+// lastClickWasDrag / wasDragged() のガードで塞いでいる（下記参照）。また、xterm.js の
+// Linkifier は event.button も見ずに activate を呼ぶため、右クリック・中クリックでも
+// 開いてしまう穴（HIGH-1）もあり、utils/terminalLinkPolicy.js の activate() 冒頭で
+// event.button を弾くガードを追加した。後から読む人がこの誤りを踏襲しないよう、
+// 実装（utils/terminalLinkPolicy.js）側のコメントに詳細を書いてある。
+//
+// また矩形選択の修飾キーは Alt（xterm.js 本体の SelectionService.shouldColumnSelect）
+// であり、'modifier' モードで使う Cmd（macOS）/ Ctrl（Windows・Linux）とは別のキーの
+// ため競合しない（これは今回の指摘の対象ではない、独立した事実）。
+//
+// クリック判定（isMacPlatform / isLinkOpenModifierPressed / normalizeTerminalLinkClickMode /
+// createTerminalLinkHandlers）は utils/terminalLinkPolicy.js の UMD へ切り出してある。
+// この機能で最もセキュリティに効く分岐（フォーカス未取得ペインへの最初のクリックや、
+// 'modifier' モードでの修飾キー無しクリック、右クリック・中クリック、ドラッグ選択では
+// 絶対に外部 URL を開かせない）を renderer/app.js の非エクスポート関数のままにせず、
+// tests/terminalLinkPolicy.test.js から直接ユニットテストできるようにするため
+// （安藤レビュー指摘・MEDIUM）。
+const { isMacPlatform, createTerminalLinkHandlers, normalizeTerminalLinkClickMode, isDragDistance } = window.VKTerminalLinkPolicy;
 const IS_MAC_PLATFORM = isMacPlatform();
+// 'modifier' モード専用のラベル（'click' モードでは使わない。termLinkTooltipMessage 参照）。
 const TERM_LINK_MODIFIER_LABEL = IS_MAC_PLATFORM ? '⌘+クリックで開く' : 'Ctrl+クリックで開く';
+
+// openExternalUrlSafe(url) のラッパー。ペイン内 URL クリックで開いたときだけ、
+// 開いた直後に短いトーストで知らせる（issue #385）。サイドバーメニューなど他の
+// openExternalUrlSafe 呼び出し元の挙動は変えないため、ここでだけ onSuccess を渡す。
+function openTerminalLinkUrl(url) {
+  openExternalUrlSafe(url, {
+    onSuccess: () => showTerminalLinkOpenedToast(url),
+  });
+}
+
+// 開いたことを知らせるトースト文言を出す。既存のトースト基盤（showGenericToast /
+// ensureExternalUrlToast）を再利用し、新しいトースト実装は増やさない。取り消しボタンは
+// 付けない（shell.openExternal で開いたタブをアプリ側から閉じられず、機能しないボタンに
+// なるため）。
+function showTerminalLinkOpenedToast(url) {
+  const host = getUrlHost(url);
+  showGenericToast(host ? `${host} を開きました` : '外部リンクを開きました');
+}
 
 // ホバー中のツールチップ本体。全ペイン共通で 1 つだけ用意し、都度使い回す
 // （externalUrlToast と同じ考え方。document.body 直下に置き、#root の render() による
@@ -1087,9 +1282,17 @@ function ensureTermLinkTooltip() {
 // 確認できるようにする。なお renderer/urlLinkify.js の extractUrlMatches はユーザー情報
 // 付き URL 自体をそもそもリンク化しないため、ここに渡ってくる url は通常そのケースには
 // 該当しないが、ツールチップ自体は「実ホストを見せる」という独立した防御として残す。
+//
+// 遷移先ホストの表示は 'click' / 'modifier' の両モードで残す（issue #385）。単クリック化で
+// クリックの心理的ハードルが下がるぶん、なりすまし対策としての重要度がむしろ上がるため
+// （安藤のセキュリティ指摘）。'click' モードは予告文（「◯◯ を開きます」）にし、クリックしろと
+// 指示する文にはしない。'modifier' モードは従来どおり TERM_LINK_MODIFIER_LABEL を使う。
 function termLinkTooltipMessage(url) {
   const host = getUrlHost(url);
-  return host ? `${host} を ${TERM_LINK_MODIFIER_LABEL}` : TERM_LINK_MODIFIER_LABEL;
+  if (terminalLinkClickModePref === 'modifier') {
+    return host ? `${host} を ${TERM_LINK_MODIFIER_LABEL}` : TERM_LINK_MODIFIER_LABEL;
+  }
+  return host ? `${host} を開きます` : '開きます';
 }
 
 // カーソル位置の近くにツールチップを表示する。pointer-events: none にしてあるため
@@ -2045,7 +2248,14 @@ function renderStashItem(id, idx, count) {
     if (terminals[id]?.lock?.close === false) return;
     closePane(id);
   });
-  li.addEventListener('mousedown', () => focusPane(id));
+  li.addEventListener('mousedown', () => {
+    // .pane 側と同じフォーカスガード記録が必要（issue #385 レビュー指摘・MEDIUM-1）。
+    // 格納ペインの xterm 要素は render() の再アタッチで .stash-item .term-container へ
+    // 移されて生きたまま操作でき、リンクプロバイダも登録済みのままのため、ここで記録を
+    // 省くと格納中のペインだけガードが機能しない（もしくは逆に常に開かなくなる）。
+    recordPaneFocusBeforeMousedown(id);
+    focusPane(id);
+  });
 
   return li;
 }
@@ -2483,6 +2693,9 @@ function closePane(paneId, { force = false, skipConfirm = false } = {}) {
     t.term.dispose();
     VKIpc.send('terminal:kill', t.termId);
     delete terminals[paneId];
+    // ペイン内 URL クリックのフォーカスガード用に記録した値も、消えたペインの分は
+    // 掃除しておく（issue #385。他の per-pane 状態と同じ扱い）。
+    paneFocusBeforeMousedown.delete(paneId);
   }
 
   // グリッド・格納のどちらに居ても取り除く（issue #89）。
@@ -3356,7 +3569,17 @@ function renderLeaf(node) {
     if (terminals[node.id]?.lock?.close === false) return;
     closePane(node.id);
   });
-  el.addEventListener('mousedown', () => focusPane(node.id));
+  el.addEventListener('mousedown', () => {
+    // ペイン内 URL クリックのフォーカスガード（issue #385）: このペインが「切り替わる直前」
+    // 既にフォーカス済みだったかを、focusPane() で書き換える前に記録しておく。xterm.js の
+    // Linkifier は mousedown ではなく後続の mouseup で activate を呼ぶため、記録を怠ると
+    // activate 発火時点では既にこの focusPane() でフォーカスが切り替わった後の値しか
+    // 読めなくなる（詳細は utils/terminalLinkPolicy.js の createTerminalLinkHandlers
+    // 冒頭コメント参照）。格納ペイン（.stash-item）側にも同じ記録が必要なため、直書きせず
+    // 共通ヘルパー recordPaneFocusBeforeMousedown() 経由にする（レビュー指摘・MEDIUM-1）。
+    recordPaneFocusBeforeMousedown(node.id);
+    focusPane(node.id);
+  });
 
   // ─── Drag & Drop: pane reordering (issue #40 → グリッド化で並べ替えに変更) ──
   // 別ペインのタスクタイトル行をドラッグして、このペインの左/上（前）・右/下（後）に
@@ -3642,7 +3865,13 @@ window.addEventListener('resize', () => setSidebarWidth(getSidebarWidth()));
 // ウィンドウがフォーカスを失うと、ホバー中のマウス位置を xterm 側が追跡し続けられず
 // leave が発火しないケースがある（例: ホバーしたまま Cmd+Tab で他アプリへ切り替える）。
 // position: fixed のツールチップが画面に残り続けるのを防ぐ（安藤レビュー指摘・LOW）。
-window.addEventListener('blur', hideTermLinkTooltip);
+window.addEventListener('blur', () => {
+  hideTermLinkTooltip();
+  // 次の mousedown は「ウィンドウを前面に出すためのクリック」かもしれないため、
+  // recordPaneFocusBeforeMousedown() がフォーカス状態を強制的に false 扱いにできる
+  // よう印を付ける（issue #385 レビュー指摘・MEDIUM-5）。
+  pendingWindowRefocusClick = true;
+});
 
 // ─── 設定パネル（汎用）────────────────────────────────────────────────────────
 // main プロセス（settings:describe / settings:save）経由で、呼び出し側が env
@@ -5859,6 +6088,8 @@ async function initApp() {
     newPaneAutoLaunchClaude = !!(cfg && cfg.newPaneAutoLaunchClaude);
     // main 側でも正規化済みだが、取得失敗・欠落に備えてここでも既定 'busy' に落とす。
     confirmClosePref = normalizeConfirmClose(cfg && cfg.confirmClose);
+    // main 側でも正規化済みだが、取得失敗・欠落に備えてここでも既定 'click' に落とす（issue #385）。
+    terminalLinkClickModePref = normalizeTerminalLinkClickMode(cfg && cfg.terminalLinkClickMode);
     waitingExcludeCwdPatterns = normalizeWaitingExcludeCwdPatterns(cfg && cfg.waitingExcludeCwdPatterns);
     commandsConfigured = !!(cfg && typeof cfg.commandsFile === 'string' && cfg.commandsFile.trim());
     renderWidget();
@@ -5886,6 +6117,8 @@ async function initApp() {
   }
   terminals = {};
   focusedPaneId = null;
+  // 破棄済みペイン分のフォーカスガード記録も一掃する（issue #385。terminals と同じ扱い）。
+  paneFocusBeforeMousedown.clear();
 
   const paneId = newId();
   // stashOrder: サイドバー格納ペインの並び（issue #89）。sidebarWidth: セッション内の可変幅。

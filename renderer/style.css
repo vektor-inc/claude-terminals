@@ -1350,8 +1350,29 @@ body:has(.confirm-overlay) .vk-toast-layer {
   right: auto;
   left: 16px;
 }
+/* overflow: hidden（レビュー指摘・MEDIUM-3）: このトーストは issue #385 でホスト名を
+ * 含む「◯◯ を開きました」文言も表示するようになった。ホストは DNS 上分割不能な
+ * 1 ラベル最大 63 文字・全体最大 253 文字まで作れるが、.vk-toast-message に折り返し
+ * 指定が無いと、この箱（max-width: 320px）・レイヤー（right: 16px 固定）の外へ
+ * はみ出す。.vk-toast-layer は document.body 直下 / 右下固定のため、はみ出した部分は
+ * 画面外へクリップされ「先頭の github.com. だけが見える」状態になりうる（これは
+ * .term-link-tooltip 側で既に塞いだのと同じ穴。同ファイルの .term-link-tooltip
+ * コメント参照）。overflow: hidden で箱の外へ絶対にはみ出させず、下の
+ * .vk-toast-message 側の overflow-wrap と合わせて箱の内側で必ず折り返す。 */
+/* pointer-events は既定 none（レビュー指摘・issue #385。麗美の e2e で発見）:
+ * このトーストは
+ * issue #385 でリンクを開くたびに毎回表示するようになり、露出が桁違いに増えた。
+ * コピーボタンを持たない（＝操作できる部品が無い）状態のまま pointer-events: auto の
+ * ままだと、画面右下の表示領域に別の URL が重なっていた場合、リンクを開いた直後に
+ * その URL をクリックしてもクリックがトーストに吸われてターミナルへ届かず、
+ * 「クリックしても何も起きない」という、この PR が改善しようとしている操作そのものを
+ * 壊してしまう。.term-link-tooltip と同じ考え方（同要素のコメント参照）で、操作できる
+ * 部品が無いときはクリックを下（ターミナル等）へ透過させる。コピーボタンを持つ
+ * 失敗トースト表示中はボタンが押せなくなっては困るため、.vk-toast--interactive を
+ * 付けて pointer-events: auto を戻す（renderer/app.js の setExternalUrlToastInteractive
+ * 参照。呼び出しごとに動的に切り替わる）。 */
 .vk-toast {
-  pointer-events: auto;
+  pointer-events: none;
   max-width: 320px;
   padding: 10px 12px;
   border-radius: var(--vktm--border-radius--md);
@@ -1361,12 +1382,21 @@ body:has(.confirm-overlay) .vk-toast-layer {
   font-size: 13px;
   line-height: 1.6;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+.vk-toast.vk-toast--interactive {
+  pointer-events: auto;
 }
 .vk-toast[hidden] {
   display: none;
 }
+/* overflow-wrap: anywhere（レビュー指摘・MEDIUM-3）: 上の .vk-toast の overflow: hidden
+ * コメント参照。text-overflow: ellipsis は使わない。末尾を省略すると「先頭の
+ * github.com. だけ見える」という、まさに防ぎたい状態を作ってしまうため
+ * （.term-link-tooltip と同じ判断）。 */
 .vk-toast-message {
   margin: 0;
+  overflow-wrap: anywhere;
 }
 .vk-toast-copy {
   margin-top: 8px;

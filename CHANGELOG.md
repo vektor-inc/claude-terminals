@@ -1,5 +1,7 @@
 # Changelog
 
+- [ 仕様変更 ] ペイン内 URL リンクの既定の開き方を修飾キー無しの単クリックへ変更（`terminalLinkClickMode` 設定で従来の ⌘/Ctrl+クリック必須の挙動にも戻せる）（[#385](https://github.com/vektor-inc/vk-terminals/issues/385)）
+
 ## 1.60.2
 
 - [ 仕様変更 ] 設定パネルの各入力欄にある説明文を初期状態では隠し、ラベル横の `?` ボタンで開閉できるよう変更（[#383](https://github.com/vektor-inc/vk-terminals/issues/383)）

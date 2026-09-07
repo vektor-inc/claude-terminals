@@ -39,6 +39,7 @@ const { createCodexUsageTracker } = require('./codexUsageTracker');
 // 等）が argv で GPU スイッチを明示している場合は介入しない。詳細は utils/gpu.js を参照。
 const { applyGpuMode } = require('./utils/gpu');
 const { normalizeConfirmClose } = require('./utils/closeConfirm');
+const { normalizeTerminalLinkClickMode } = require('./utils/terminalLinkPolicy');
 // 外部ブラウザで開いてよい URL の判定（renderer と共有）。renderer 側にも同じ判定が
 // あるが、最終防衛線はこのプロセス側（issue #268）。
 const { isSafeHttpUrl } = require('./renderer/urlSafety');
@@ -972,6 +973,8 @@ ipcMain.handle('app:get-config', () => {
     newPaneAutoLaunchClaude: config.newPaneAutoLaunchClaude === true,
     // ペインを閉じる時の確認（issue #184）。不正値・未指定は既定 'busy' に正規化して渡す。
     confirmClose: normalizeConfirmClose(config.confirmClose),
+    // ペイン内 URL のクリック挙動（issue #385）。不正値・未指定は既定 'click' に正規化して渡す。
+    terminalLinkClickMode: normalizeTerminalLinkClickMode(config.terminalLinkClickMode),
     waitingExcludeCwdPatterns,
     widgetFile,
     // tasksFile（旧 tasks-view.json）は dual-write 期間の後方互換注記判定に残す。
