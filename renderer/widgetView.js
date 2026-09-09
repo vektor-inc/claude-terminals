@@ -474,12 +474,37 @@
 
       const controls = el('div', 'task-edit-controls');
       let firstControl = null;
+      // section でグループ化する。判定は「直前の項目との比較」のみで行い、id をキーにした
+      // Map で束ねない（間に別項目を挟んで同じ id が再登場した場合、離れた項目まで誤って
+      // 1 グループへ統合されるのを防ぐため。issue #389）。
+      let currentFieldset = null;
+      let currentSectionId = null;
       for (const control of getControls(item)) {
         const controlEl = buildControl(item, control, saving || isPending);
         if (!firstControl) {
           firstControl = controlEl.childNodes[1] || controlEl;
         }
-        controls.appendChild(controlEl);
+        const sectionId = (control.section && typeof control.section.id === 'string' && control.section.id)
+          ? control.section.id
+          : null;
+        if (sectionId && sectionId === currentSectionId) {
+          currentFieldset.appendChild(controlEl);
+        } else if (sectionId) {
+          const fieldset = el('fieldset', 'task-edit-section');
+          if (control.section.label) {
+            const legend = el('legend');
+            legend.textContent = control.section.label;
+            fieldset.appendChild(legend);
+          }
+          fieldset.appendChild(controlEl);
+          controls.appendChild(fieldset);
+          currentFieldset = fieldset;
+          currentSectionId = sectionId;
+        } else {
+          controls.appendChild(controlEl);
+          currentFieldset = null;
+          currentSectionId = null;
+        }
       }
       panel.appendChild(controls);
 

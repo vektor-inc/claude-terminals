@@ -535,3 +535,152 @@ test('render: 無効な選択肢は disabledReason を末尾ラベルと title �
   const readyOption = options.find((o) => o.value === 'ready');
   assert.equal(readyOption.textContent, '実行待ち');
 });
+
+// ── section によるグループ化（issue #389）─────────────────────────────────
+
+function openEditPanel(widget) {
+  const { doc, groupsEl, view } = makeView();
+  view.render(widget, { now: Date.parse('2026-07-21T00:00:10.000Z') });
+  groupsEl.querySelectorAll((el) => el.classList.contains('task-item-edit'))[0].dispatch('click');
+  view.render(widget, { now: Date.parse('2026-07-21T00:00:10.000Z') });
+  return { doc, groupsEl, view };
+}
+
+test('render: 連続する同じ section.id は 1 つの <fieldset> にまとまり、見出しは 1 回だけ描かれる', () => {
+  const widget = sanitized([
+    { id: 'ready', label: '実行待ち', tone: 'info', items: [{
+      id: '10', title: 'T', editable: true,
+      controls: [
+        { type: 'select', field: 'reviewCoderabbit', label: 'CodeRabbit', current: 'disabled',
+          section: { id: 'review', label: 'レビュー' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+        { type: 'select', field: 'reviewCodeReview', label: 'コードレビュー', current: 'disabled',
+          section: { id: 'review', label: 'レビュー' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+      ],
+    }] },
+  ]);
+  const { groupsEl } = openEditPanel(widget);
+
+  const fieldsets = groupsEl.querySelectorAll((el) => el.classList.contains('task-edit-section'));
+  assert.equal(fieldsets.length, 1);
+  assert.equal(fieldsets[0].tagName, 'FIELDSET');
+  assert.equal(fieldsets[0].getAttribute('disabled'), null);
+  const legends = groupsEl.querySelectorAll((el) => el.tagName === 'LEGEND');
+  assert.equal(legends.length, 1);
+  assert.equal(legends[0].textContent, 'レビュー');
+  // 2 個の select が同じ fieldset の配下に入っている。
+  const selectsInFieldset = fieldsets[0].querySelectorAll((el) => el.tagName === 'SELECT');
+  assert.equal(selectsInFieldset.length, 2);
+});
+
+test('render: 同じ section.id でも間に別項目を挟んで再登場した場合は別グループになる', () => {
+  const widget = sanitized([
+    { id: 'ready', label: '実行待ち', tone: 'info', items: [{
+      id: '10', title: 'T', editable: true,
+      controls: [
+        { type: 'select', field: 'reviewCoderabbit', label: 'CodeRabbit', current: 'disabled',
+          section: { id: 'review', label: 'レビュー' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+        { type: 'select', field: 'automerge', label: '自動マージ', current: 'disabled',
+          section: { id: 'automerge', label: '自動マージ' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+        { type: 'select', field: 'reviewCodeReview', label: 'コードレビュー', current: 'disabled',
+          section: { id: 'review', label: 'レビュー' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+      ],
+    }] },
+  ]);
+  const { groupsEl } = openEditPanel(widget);
+
+  const fieldsets = groupsEl.querySelectorAll((el) => el.classList.contains('task-edit-section'));
+  // review → automerge → review は 3 グループ（id が同じでも連続していないため統合しない）。
+  assert.equal(fieldsets.length, 3);
+  const legends = groupsEl.querySelectorAll((el) => el.tagName === 'LEGEND');
+  assert.deepEqual(legends.map((l) => l.textContent), ['レビュー', '自動マージ', 'レビュー']);
+  assert.equal(fieldsets[0].querySelectorAll((el) => el.tagName === 'SELECT').length, 1);
+  assert.equal(fieldsets[2].querySelectorAll((el) => el.tagName === 'SELECT').length, 1);
+});
+
+test('render: section 付きと section 無しの項目が混在する場合、無し項目を挟むと前後の同じ section.id は別グループになる', () => {
+  const widget = sanitized([
+    { id: 'ready', label: '実行待ち', tone: 'info', items: [{
+      id: '10', title: 'T', editable: true,
+      controls: [
+        { type: 'select', field: 'reviewCoderabbit', label: 'CodeRabbit', current: 'disabled',
+          section: { id: 'A', label: 'Aラベル' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+        { type: 'select', field: 'automerge', label: '自動マージ', current: 'disabled',
+          options: [{ value: 'disabled', label: 'しない' }] },
+        { type: 'select', field: 'reviewCodeReview', label: 'コードレビュー', current: 'disabled',
+          section: { id: 'A', label: 'Aラベル' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+      ],
+    }] },
+  ]);
+  const { groupsEl } = openEditPanel(widget);
+
+  const fieldsets = groupsEl.querySelectorAll((el) => el.classList.contains('task-edit-section'));
+  // A → 無し → A は 2 グループ（同じ section.id でも間に無し項目を挟むと統合しない）。
+  assert.equal(fieldsets.length, 2);
+
+  const controlsContainer = groupsEl.querySelectorAll((el) => el.classList.contains('task-edit-controls'))[0];
+  // DOM 上の並び順は宣言順（A → 無し → A）のまま保たれる。無し項目は <fieldset> の外に平坦なまま置かれる。
+  assert.deepEqual(controlsContainer.children.map((c) => c.tagName), ['FIELDSET', 'LABEL', 'FIELDSET']);
+  assert.equal(controlsContainer.children[1].classList.contains('widget-control'), true);
+  assert.equal(controlsContainer.children[1].parentNode, controlsContainer);
+
+  assert.equal(fieldsets[0].querySelectorAll((el) => el.tagName === 'SELECT').length, 1);
+  assert.equal(fieldsets[1].querySelectorAll((el) => el.tagName === 'SELECT').length, 1);
+  assert.equal(groupsEl.querySelectorAll((el) => el.tagName === 'SELECT').length, 3);
+});
+
+test('render: section を 1 つも持たない宣言では <fieldset> を作らず従来どおり平坦に並ぶ', () => {
+  const widget = editableWidgetWithControls();
+  const { groupsEl } = openEditPanel(widget);
+
+  const fieldsets = groupsEl.querySelectorAll((el) => el.tagName === 'FIELDSET');
+  assert.equal(fieldsets.length, 0);
+  assert.equal(groupsEl.querySelectorAll((el) => el.tagName === 'SELECT').length, 3);
+});
+
+test('render: section.label が空文字のときは <fieldset> だけ作り <legend> は描かない', () => {
+  const widget = sanitized([
+    { id: 'ready', label: '実行待ち', tone: 'info', items: [{
+      id: '10', title: 'T', editable: true,
+      controls: [
+        { type: 'select', field: 'status', label: 'ステータス', current: 'ready',
+          section: { id: 'grp', label: '' },
+          options: [{ value: 'ready', label: '実行待ち' }] },
+      ],
+    }] },
+  ]);
+  const { groupsEl } = openEditPanel(widget);
+
+  const fieldsets = groupsEl.querySelectorAll((el) => el.classList.contains('task-edit-section'));
+  assert.equal(fieldsets.length, 1);
+  const legends = groupsEl.querySelectorAll((el) => el.tagName === 'LEGEND');
+  assert.equal(legends.length, 0);
+});
+
+test('render: firstControl はグループ化しても、パネル全体で最初の 1 個のまま', () => {
+  const widget = sanitized([
+    { id: 'ready', label: '実行待ち', tone: 'info', items: [{
+      id: '10', title: 'T', editable: true,
+      controls: [
+        { type: 'select', field: 'status', label: 'ステータス', current: 'ready',
+          section: { id: 'a', label: 'A' },
+          options: [{ value: 'ready', label: '実行待ち' }] },
+        { type: 'select', field: 'priority', label: '優先度', current: 'medium',
+          section: { id: 'b', label: 'B' },
+          options: [{ value: 'medium', label: '中' }] },
+      ],
+    }] },
+  ]);
+  const { doc, groupsEl } = openEditPanel(widget);
+  // 開いた直後のフォーカスは「パネル全体で最初の 1 個」（= status の select）でなければならない。
+  // グループごとにループを組み直すと各グループ先頭で毎回上書きしてしまうため、
+  // 2 つ目のグループ（priority）が最終的に残っていないことを確認する。
+  const statusSelect = groupsEl.querySelectorAll((el) => el.tagName === 'SELECT').find((el) => el.dataset.field === 'status');
+  assert.equal(doc.activeElement, statusSelect);
+});

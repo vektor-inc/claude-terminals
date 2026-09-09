@@ -179,6 +179,17 @@
     return option;
   }
 
+  // control.section は「連続する同じ id を 1 グループにまとめて見出しを出す」ための任意付加情報
+  // （issue #389）。id が無い／文字列でないと束ねようがないため、その場合は section 自体を無視する。
+  function sanitizeSection(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    if (typeof raw.id !== 'string' || !raw.id) return null;
+    return {
+      id: clampStr(raw.id, LIMITS.id),
+      label: clampStr(typeof raw.label === 'string' ? raw.label : '', LIMITS.text),
+    };
+  }
+
   function sanitizeControl(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     if (!CONTROL_TYPE_SET.has(raw.type)) return null; // 未知 type は無視
@@ -190,7 +201,7 @@
       if (option) options.push(option);
     }
     if (options.length === 0) return null;
-    return {
+    const control = {
       type: raw.type,
       field: raw.field,
       label: clampStr(typeof raw.label === 'string' ? raw.label : '', LIMITS.text),
@@ -198,6 +209,9 @@
       current: clampStr(coerceCommandValue(raw.current) || '', LIMITS.text),
       options,
     };
+    const section = sanitizeSection(raw.section);
+    if (section) control.section = section;
+    return control;
   }
 
   function sanitizeLink(raw) {
