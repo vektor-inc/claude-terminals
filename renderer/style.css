@@ -2146,11 +2146,24 @@ button.sidebar-section-header:hover {
   font-weight: 600;
   line-height: 1.3;
 }
+/* ラベル列は 13ch の固定幅（issue #470: 「/code-review」だけ旧 68px 決め打ちに収まらず
+   折り返していたための対応）。px の決め打ちをやめ、デスクトップ/スマホ双方の
+   mobile.css と同じ「13ch」表記に揃え、フォントサイズ差の px 突き合わせ運用を避ける。
+   .widget-control 自身は本来フォント指定を持たず継承する要素だが、継承元の html, body
+   （renderer/style.css）はフォントサイズを指定しておらず、ブラウザ既定の 16px が使われる。
+   無指定のままだと ch はその 16px を基準に解決され、.widget-control-label の実際の
+   文字サイズ（11px / font-weight 600）より大きく算出されて欄が広がりすぎるため、
+   ch の基準をラベルと揃うよう font-size / font-weight をここで明示している。
+   固定長を維持する（max-content 等の中身依存にはしない）のは、.widget-control が
+   項目ごとに独立した <label>（6 個）として生成され、中身依存にすると行ごとに欄幅が
+   変わり select 列の左端が揃わなくなるため。 */
 .widget-control {
   display: grid;
-  grid-template-columns: 68px minmax(0, 1fr);
+  grid-template-columns: 13ch minmax(0, 1fr);
   align-items: center;
   gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
 }
 .widget-control-label {
   color: #8b949e;
@@ -2158,7 +2171,7 @@ button.sidebar-section-header:hover {
   font-weight: 600;
   line-height: 1.3;
   /* ラベル文言は vk-orchestrator 側から渡ってくるため長さを制御できない。
-     nowrap のままだと固定 68px 幅を突き破って隣の select 列に重なるため、
+     nowrap のままだと固定 13ch 幅を突き破って隣の select 列に重なるため、
      必要な場合のみ折り返す（短いラベルは従来どおり1行のまま）。 */
   overflow-wrap: anywhere;
 }
