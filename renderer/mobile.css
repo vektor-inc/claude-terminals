@@ -576,6 +576,32 @@ button.k.kill.is-locked:active { background: #6b3f3f; border-color: #7c4a4a; }
   display: grid;
   gap: 11px;
 }
+/* section でまとめたコントロール群（issue #389）。<fieldset> は既定のボーダー・パディングを
+   持つため一旦リセットする。min-width: 0 を外すと、親が display: grid の .task-edit-controls
+   のため <legend> の文字量でカラム幅が押し広げられることがある。 */
+.task-edit-section {
+  display: grid;
+  gap: 11px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+/* グループ間の余白は、グループ内の間隔（gap: 11px）より必ず大きくする
+   （2 つ目以降のグループにだけ区切り線を出す）。 */
+.task-edit-section:not(:first-child) {
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid #21262d;
+}
+.task-edit-section legend {
+  margin: 0 0 8px;
+  padding: 0;
+  color: #8b949e;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+}
 .widget-control {
   display: grid;
   grid-template-columns: 68px minmax(0, 1fr);

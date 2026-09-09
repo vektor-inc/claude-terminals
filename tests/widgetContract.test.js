@@ -162,6 +162,57 @@ test('sanitizeWidget: reviewCoderabbit / reviewCodeReview の select コント�
   assert.equal(controls[1].options[1].command.action, 'set-review-code-review');
 });
 
+test('sanitizeWidget: control.section は id / label を保持する（issue #389）', () => {
+  const w = contract.sanitizeWidget(baseRawWidget({
+    groups: [{ id: 'ready', label: '準備完了', tone: 'info', items: [{
+      id: '254', title: 'review task', editable: true,
+      controls: [{
+        type: 'select',
+        field: 'reviewCodeReview',
+        label: 'コードレビュー',
+        current: 'disabled',
+        section: { id: 'review', label: 'レビュー' },
+        options: [{ value: 'disabled', label: 'しない' }],
+      }],
+    }] }],
+  }));
+  const control = w.groups[0].items[0].controls[0];
+  assert.deepEqual(control.section, { id: 'review', label: 'レビュー' });
+});
+
+test('sanitizeWidget: control.section.id が無い／文字列でない場合は section 自体を無視する', () => {
+  const w = contract.sanitizeWidget(baseRawWidget({
+    groups: [{ id: 'ready', label: '準備完了', tone: 'info', items: [{
+      id: '254', title: 'review task', editable: true,
+      controls: [
+        {
+          type: 'select', field: 'status', label: 'ステータス', current: 'ready',
+          section: { label: 'id なし' },
+          options: [{ value: 'ready', label: '実行待ち' }],
+        },
+        {
+          type: 'select', field: 'priority', label: '優先度', current: 'medium',
+          section: { id: 42, label: 'id が数値' },
+          options: [{ value: 'medium', label: '中' }],
+        },
+      ],
+    }] }],
+  }));
+  const controls = w.groups[0].items[0].controls;
+  assert.equal(Object.prototype.hasOwnProperty.call(controls[0], 'section'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(controls[1], 'section'), false);
+});
+
+test('sanitizeWidget: control.section が無い宣言（旧 VK Orchestrator）では section を持たない', () => {
+  const w = contract.sanitizeWidget(baseRawWidget({
+    groups: [{ id: 'ready', label: '準備完了', tone: 'info', items: [{
+      id: '254', title: 'task', editable: true,
+      controls: [{ type: 'select', field: 'status', label: 'ステータス', current: 'ready', options: [{ value: 'ready', label: '実行待ち' }] }],
+    }] }],
+  }));
+  assert.equal(Object.prototype.hasOwnProperty.call(w.groups[0].items[0].controls[0], 'section'), false);
+});
+
 test('sanitizeWidget: emphasis は attention のみ、それ以外は無視', () => {
   const w = contract.sanitizeWidget(baseRawWidget({
     groups: [{ id: 'g', label: 'G', tone: 'warning', items: [

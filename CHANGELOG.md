@@ -1,5 +1,7 @@
 # Changelog
 
+- [ 機能追加 ] タスク編集パネルのプルダウンを、宣言側が項目ごとに指定した見出し（`section`）でグループ化して描画できるよう対応を追加（実際に見出しが表示されるのは VK Orchestrator 側の宣言が対応してから）（[#389](https://github.com/vektor-inc/vk-terminals/issues/389)）
+
 ## 1.61.0
 
 - [ 機能追加 ] タスクの編集画面で、そのタスクの CodeRabbit レビュー・コードレビューを実施するかスキップするかを選べるようにする対応を追加（実際に選択肢が表示されるのは VK Orchestrator 側の対応が入ってから）（[#387](https://github.com/vektor-inc/vk-terminals/issues/387)）

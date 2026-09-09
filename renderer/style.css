@@ -2120,6 +2120,32 @@ button.sidebar-section-header:hover {
   display: grid;
   gap: 8px;
 }
+/* section でまとめたコントロール群（issue #389）。<fieldset> は既定のボーダー・パディングを
+   持つため一旦リセットする。min-width: 0 を外すと、親が display: grid の .task-edit-controls
+   のため <legend> の文字量でカラム幅が押し広げられることがある。 */
+.task-edit-section {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+/* グループ間の余白（12px）は、グループ内の間隔（gap: 8px）より必ず大きくする
+   （2 つ目以降のグループにだけ区切り線を出す）。 */
+.task-edit-section:not(:first-child) {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid #21262d;
+}
+.task-edit-section legend {
+  margin: 0 0 6px;
+  padding: 0;
+  color: #8b949e;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+}
 .widget-control {
   display: grid;
   grid-template-columns: 68px minmax(0, 1fr);
