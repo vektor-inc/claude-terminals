@@ -602,6 +602,39 @@ test('render: 同じ section.id でも間に別項目を挟んで再登場した
   assert.equal(fieldsets[2].querySelectorAll((el) => el.tagName === 'SELECT').length, 1);
 });
 
+test('render: section 付きと section 無しの項目が混在する場合、無し項目を挟むと前後の同じ section.id は別グループになる', () => {
+  const widget = sanitized([
+    { id: 'ready', label: '実行待ち', tone: 'info', items: [{
+      id: '10', title: 'T', editable: true,
+      controls: [
+        { type: 'select', field: 'reviewCoderabbit', label: 'CodeRabbit', current: 'disabled',
+          section: { id: 'A', label: 'Aラベル' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+        { type: 'select', field: 'automerge', label: '自動マージ', current: 'disabled',
+          options: [{ value: 'disabled', label: 'しない' }] },
+        { type: 'select', field: 'reviewCodeReview', label: 'コードレビュー', current: 'disabled',
+          section: { id: 'A', label: 'Aラベル' },
+          options: [{ value: 'disabled', label: 'しない' }] },
+      ],
+    }] },
+  ]);
+  const { groupsEl } = openEditPanel(widget);
+
+  const fieldsets = groupsEl.querySelectorAll((el) => el.classList.contains('task-edit-section'));
+  // A → 無し → A は 2 グループ（同じ section.id でも間に無し項目を挟むと統合しない）。
+  assert.equal(fieldsets.length, 2);
+
+  const controlsContainer = groupsEl.querySelectorAll((el) => el.classList.contains('task-edit-controls'))[0];
+  // DOM 上の並び順は宣言順（A → 無し → A）のまま保たれる。無し項目は <fieldset> の外に平坦なまま置かれる。
+  assert.deepEqual(controlsContainer.children.map((c) => c.tagName), ['FIELDSET', 'LABEL', 'FIELDSET']);
+  assert.equal(controlsContainer.children[1].classList.contains('widget-control'), true);
+  assert.equal(controlsContainer.children[1].parentNode, controlsContainer);
+
+  assert.equal(fieldsets[0].querySelectorAll((el) => el.tagName === 'SELECT').length, 1);
+  assert.equal(fieldsets[1].querySelectorAll((el) => el.tagName === 'SELECT').length, 1);
+  assert.equal(groupsEl.querySelectorAll((el) => el.tagName === 'SELECT').length, 3);
+});
+
 test('render: section を 1 つも持たない宣言では <fieldset> を作らず従来どおり平坦に並ぶ', () => {
   const widget = editableWidgetWithControls();
   const { groupsEl } = openEditPanel(widget);
