@@ -1324,7 +1324,10 @@ let sidebarResizeState = null;
 // サイドバー幅の既定値・下限（px）。上限はウィンドウ幅比で動的に決める（sidebarMaxWidth）。
 // 従来の 252px から約 1.3 倍に拡張した既定幅。永続化はしない（再起動で既定に戻る）。
 const DEFAULT_SIDEBAR_WIDTH = 330;
-const SIDEBAR_MIN_WIDTH = 200;
+// 下限を 200px から 240px へ引き上げた（issue vk-orchestrator#470）。200px まで縮められると
+// タスク編集パネルのプルダウンが 48px まで潰れ、選択中の項目が「全」の 1 文字しか読めなく
+// なるため。240px ではプルダウンが 88px となり「全体設定に」まで読める。
+const SIDEBAR_MIN_WIDTH = 240;
 migrateLegacyState();
 // null プロトタイプのため、hasOwnProperty など Object.prototype のメソッドは持たない。
 const sidebarSectionsCollapsed = readCollapsedSections();
