@@ -1,5 +1,7 @@
 # Changelog
 
+## 1.61.0
+
 - [ 機能追加 ] タスクの編集画面で、そのタスクの CodeRabbit レビュー・コードレビューを実施するかスキップするかを選べるようにする対応を追加（実際に選択肢が表示されるのは VK Orchestrator 側の対応が入ってから）（[#387](https://github.com/vektor-inc/vk-terminals/issues/387)）
 
 ## 1.60.3
