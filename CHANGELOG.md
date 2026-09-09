@@ -1,6 +1,6 @@
 # Changelog
 
-- [ 機能追加 ] タスクウィジェットの契約（`utils/widgetContract.js`）に CodeRabbit レビュー・コードレビューの項目（`reviewCoderabbit` / `reviewCodeReview`）と対応コマンド（`set-review-coderabbit` / `set-review-code-review`）を許可リストへ追加（[#387](https://github.com/vektor-inc/vk-terminals/issues/387)）
+- [ 機能追加 ] タスクの編集画面で、そのタスクの CodeRabbit レビュー・コードレビューを実施するかスキップするかを選べるようにする対応を追加（実際に選択肢が表示されるのは VK Orchestrator 側の対応が入ってから）（[#387](https://github.com/vektor-inc/vk-terminals/issues/387)）
 
 ## 1.60.3
 
