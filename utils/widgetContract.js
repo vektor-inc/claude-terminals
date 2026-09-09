@@ -29,12 +29,12 @@
   const WIDGET_TONE_SET = new Set(WIDGET_TONES);
   const DEFAULT_TONE = 'neutral';
 
-  // コマンドの action は 4 種のみ（新規作成しない）。
-  const COMMAND_ACTIONS = Object.freeze(['set-status', 'set-priority', 'set-sequential', 'set-automerge']);
+  // コマンドの action は 6 種のみ（新規作成しない）。
+  const COMMAND_ACTIONS = Object.freeze(['set-status', 'set-priority', 'set-sequential', 'set-automerge', 'set-review-coderabbit', 'set-review-code-review']);
   const COMMAND_ACTION_SET = new Set(COMMAND_ACTIONS);
 
-  // コントロールの field は 4 種、type は select のみ。
-  const CONTROL_FIELDS = Object.freeze(['status', 'priority', 'sequential', 'automerge']);
+  // コントロールの field は 6 種、type は select のみ。
+  const CONTROL_FIELDS = Object.freeze(['status', 'priority', 'sequential', 'automerge', 'reviewCoderabbit', 'reviewCodeReview']);
   const CONTROL_FIELD_SET = new Set(CONTROL_FIELDS);
   const CONTROL_TYPES = Object.freeze(['select']);
   const CONTROL_TYPE_SET = new Set(CONTROL_TYPES);
