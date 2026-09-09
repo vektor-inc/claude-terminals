@@ -123,6 +123,45 @@ test('sanitizeWidget: automerge の select コントロールを保持する', (
   assert.equal(control.options[1].command.action, 'set-automerge');
 });
 
+test('sanitizeWidget: reviewCoderabbit / reviewCodeReview の select コントロールを保持する', () => {
+  const w = contract.sanitizeWidget(baseRawWidget({
+    groups: [{ id: 'ready', label: '準備完了', tone: 'info', items: [{
+      id: '254', title: 'review task', editable: true,
+      controls: [
+        {
+          type: 'select',
+          field: 'reviewCoderabbit',
+          label: 'CodeRabbit レビュー',
+          ariaLabel: 'CodeRabbit レビューを選択',
+          current: 'disabled',
+          options: [
+            { value: 'disabled', label: 'しない' },
+            { value: 'enabled', label: 'する', command: { action: 'set-review-coderabbit', taskId: '254', to: 'enabled', expected: 'disabled' } },
+          ],
+        },
+        {
+          type: 'select',
+          field: 'reviewCodeReview',
+          label: 'コードレビュー',
+          ariaLabel: 'コードレビューを選択',
+          current: 'disabled',
+          options: [
+            { value: 'disabled', label: 'しない' },
+            { value: 'enabled', label: 'する', command: { action: 'set-review-code-review', taskId: '254', to: 'enabled', expected: 'disabled' } },
+          ],
+        },
+      ],
+    }] }],
+  }));
+  const controls = w.groups[0].items[0].controls;
+  assert.equal(controls[0].field, 'reviewCoderabbit');
+  assert.equal(controls[0].type, 'select');
+  assert.equal(controls[0].options[1].command.action, 'set-review-coderabbit');
+  assert.equal(controls[1].field, 'reviewCodeReview');
+  assert.equal(controls[1].type, 'select');
+  assert.equal(controls[1].options[1].command.action, 'set-review-code-review');
+});
+
 test('sanitizeWidget: emphasis は attention のみ、それ以外は無視', () => {
   const w = contract.sanitizeWidget(baseRawWidget({
     groups: [{ id: 'g', label: 'G', tone: 'warning', items: [
@@ -183,6 +222,31 @@ test('sanitizeCommand: set-automerge の単一コマンドを保持する', () =
   });
 });
 
+test('sanitizeCommand: set-review-coderabbit / set-review-code-review の単一コマンドを保持する', () => {
+  assert.deepEqual(contract.sanitizeCommand({
+    action: 'set-review-coderabbit',
+    taskId: '254',
+    to: 'enabled',
+    expected: 'disabled',
+  }), {
+    action: 'set-review-coderabbit',
+    taskId: '254',
+    to: 'enabled',
+    expected: 'disabled',
+  });
+  assert.deepEqual(contract.sanitizeCommand({
+    action: 'set-review-code-review',
+    taskId: '254',
+    to: 'enabled',
+    expected: 'disabled',
+  }), {
+    action: 'set-review-code-review',
+    taskId: '254',
+    to: 'enabled',
+    expected: 'disabled',
+  });
+});
+
 test('buildBatchCommandLine: apply-batch 断片に id / requestedAt を付与し ops を保持する', () => {
   const line = contract.buildBatchCommandLine(
     {
@@ -223,6 +287,24 @@ test('sanitizeBatchCommand: apply-batch の ops に set-automerge を保持す�
     ops: [
       { action: 'set-status', to: 'awaiting-approval', expected: 'ready' },
       { action: 'set-automerge', to: 'enabled', expected: 'disabled' },
+    ],
+  });
+});
+
+test('sanitizeBatchCommand: apply-batch の ops に set-review-coderabbit / set-review-code-review を保持する', () => {
+  assert.deepEqual(contract.sanitizeBatchCommand({
+    action: 'apply-batch',
+    taskId: '254',
+    ops: [
+      { action: 'set-review-coderabbit', to: 'enabled', expected: 'disabled' },
+      { action: 'set-review-code-review', to: 'enabled', expected: 'disabled' },
+    ],
+  }), {
+    action: 'apply-batch',
+    taskId: '254',
+    ops: [
+      { action: 'set-review-coderabbit', to: 'enabled', expected: 'disabled' },
+      { action: 'set-review-code-review', to: 'enabled', expected: 'disabled' },
     ],
   });
 });

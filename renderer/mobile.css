@@ -587,7 +587,10 @@ button.k.kill.is-locked:active { background: #6b3f3f; border-color: #7c4a4a; }
   font-size: 12px;
   font-weight: 700;
   line-height: 1.3;
-  white-space: nowrap;
+  /* ラベル文言は vk-orchestrator 側から渡ってくるため長さを制御できない。
+     nowrap のままだと固定 68px 幅を突き破って隣の select 列に重なるため、
+     必要な場合のみ折り返す（短いラベルは従来どおり1行のまま）。 */
+  overflow-wrap: anywhere;
 }
 .widget-control-select {
   min-width: 0;
