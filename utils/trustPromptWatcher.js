@@ -73,7 +73,12 @@ function getReadyPatternForEngine(engine) {
  *   テストから実時間を待たずに制御できるようにするための注入口。
  * @param {(message: string) => void} [options.log] - 検知・送信時のログ出力先。既定は
  *   何もしない関数（呼び出し側で LOG_PREFIX 等を付けたい場合に渡す）。
- * @returns {{ dispose: () => void }} 監視を止めるための disposable。冪等（複数回呼んでも安全）。
+ * @returns {{ dispose: () => void, resetBuffer: () => void }} 監視を止めるための
+ *   disposable（dispose は冪等・複数回呼んでも安全）と、蓄積済みバッファを空にする
+ *   resetBuffer。resetBuffer は、attach の後に呼び出し側が pty へ書き込む行（例:
+ *   restart-agent の `cd` コマンド）のエコーがバッファへ残ったまま次の判定に混ざらない
+ *   よう、そのエコーを書き終えた直後に呼ぶための口（issue #392 の追加対応・安藤の
+ *   指摘・LOW-G）。
  */
 function attachTrustAutoResponder(ptyProcess, options = {}) {
   const {
@@ -141,7 +146,12 @@ function attachTrustAutoResponder(ptyProcess, options = {}) {
     stopIfDone(nowValue);
   });
 
-  return { dispose };
+  return {
+    dispose,
+    resetBuffer() {
+      buffer = '';
+    },
+  };
 }
 
 module.exports = {

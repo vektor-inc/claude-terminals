@@ -262,3 +262,139 @@ test('ペイン作成経路: terminal:create と同じ node-pty の onData は�
   pty.emit('hello');
   assert.deepEqual(rendererForward, ['hello']);
 });
+
+// ─── MEDIUM-E: ペイン作成時の watcher と再起動 responder の同居による二重送信 ──────────
+// 安藤の指摘: main.js の terminal:create（ペイン作成時）と restartAgentInTerminal
+// （再起動時）は、それぞれ独立した createTrustPromptGate を持つ。作成時の watcher が
+// まだ武装している間に再起動が入ると、同じ信頼確認プロンプトへ両方が Enter を書き込み
+// うる。main.js は restartAgentInTerminal が自分の responder を取り付ける前に、
+// paneCreationTrustWatchers 経由で作成時の watcher を無効化することでこれを防ぐ。
+// terminal:create 側の watcher 自体（promptWatcher）は main.js の中に閉じた実装で
+// export されていないため、ここでは「独立したゲートを持つ2つの監視が同じ pty に
+// 同居する」という構造そのものを attachTrustAutoResponder 2つで再現し、
+// 「先に古い監視を dispose() してから新しい監視を作る」というコーディネーションの
+// 有無で結果がどう変わるかを検証する（main.js 側の Map 配線自体は対象外）。
+
+test('MEDIUM-E: 対策なしで2つの監視が同居すると、同じプロンプトに二重で Enter を送りうる（再現）', () => {
+  const pty = createFakePty();
+  const clock = createFakeClock(0);
+
+  // 「ペイン作成時の watcher」と「再起動 responder」を、それぞれ独立した
+  // createTrustPromptGate を持つ別々の監視として模す。
+  attachTrustAutoResponder(pty, { spawnTime: 0, engine: 'claude', now: clock.now }); // 作成時 watcher（解除し忘れ）
+  attachTrustAutoResponder(pty, { spawnTime: 0, engine: 'claude', now: clock.now }); // 再起動 responder
+
+  clock.advance(100);
+  pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
+
+  // 対策（先に解除する）が無ければ、両方の監視がそれぞれ1回ずつ Enter を送ってしまう。
+  assert.deepEqual(pty.writes, ['\r', '\r']);
+});
+
+test('MEDIUM-E: 新しい監視を取り付ける前に古い監視を dispose() すれば、二重送信は起きない', () => {
+  const pty = createFakePty();
+  const clock = createFakeClock(0);
+
+  // main.js の restartAgentInTerminal は、自分の responder を取り付ける前に
+  // paneCreationTrustWatchers 経由でペイン作成時の watcher を無効化する
+  // （ここでは同等のコーディネーションを dispose() で表す）。
+  const paneCreationWatcher = attachTrustAutoResponder(pty, { spawnTime: 0, engine: 'claude', now: clock.now });
+  paneCreationWatcher.dispose();
+  attachTrustAutoResponder(pty, { spawnTime: 0, engine: 'claude', now: clock.now });
+
+  clock.advance(100);
+  pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
+
+  assert.deepEqual(pty.writes, ['\r']);
+});
+
+test('MEDIUM-E: 再起動が一度も起きないペイン相当（単独の監視）では、従来どおり1回だけ応答する（回帰確認）', () => {
+  const pty = createFakePty();
+  const clock = createFakeClock(0);
+
+  attachTrustAutoResponder(pty, { spawnTime: 0, engine: 'claude', now: clock.now });
+
+  clock.advance(100);
+  pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
+
+  assert.deepEqual(pty.writes, ['\r']);
+});
+
+// ─── LOW-G: cd 行のエコーによる誤検知と resetBuffer() ──────────────────────────────
+// 安藤の指摘: responder は `cd -- '<cwd>'` の書き込みより前に取り付けられるため、
+// シェルがエコーバックする cd 行（cwd のディレクトリ名を含む）がバッファに入りうる。
+// ディレクトリ名が信頼確認の文言を含んでいた場合、本物のプロンプトが出る前に Enter を
+// 撃ち、一発限りの trustHandled を使い切ってしまう。trustGate.markTrustHandled() は
+// 一度発火すると戻せないため、resetBuffer() は「既に誤って発火してしまった後」を
+// 救う手段ではなく、「文字列が結合して誤検知を作る前に断つ」ための手段であることを
+// 踏まえてテストする。
+
+test('LOW-G（問題の再現）: cd 行のエコー相当の文言だけで trustHandled を使い切り、以後の本物のプロンプトに応答できなくなる', () => {
+  const pty = createFakePty();
+  const clock = createFakeClock(0);
+
+  attachTrustAutoResponder(pty, {
+    spawnTime: 0, engine: 'claude', trustWindowMs: 30000, readyGraceMs: 3000, now: clock.now,
+  });
+
+  // cwd が「Do you trust the contents of this folder」のようなディレクトリ名だった場合、
+  // シェルがエコーバックする cd 行自体が信頼確認の文脈に一致してしまう（安藤の実測の再現）。
+  clock.advance(10);
+  pty.emit("cd -- '/tmp/Do you trust the contents of this folder'\r\n");
+  assert.deepEqual(pty.writes, ['\r']);
+
+  // trustHandled を使い切っているため、その後に届く本物の信頼確認プロンプトには
+  // もう応答できない（= ペインが静止したまま止まる、今回の HIGH 修正が消そうとした
+  // 症状そのものが、ディレクトリ名で再現できてしまう）。
+  clock.advance(10);
+  pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
+  assert.deepEqual(pty.writes, ['\r']);
+});
+
+test('LOW-G（修正）: resetBuffer() は、リセット前後の断片が結合して誤検知を作るのを防ぎ、本物のプロンプトには応答できる', () => {
+  const pty = createFakePty();
+  const clock = createFakeClock(0);
+
+  const responder = attachTrustAutoResponder(pty, {
+    spawnTime: 0, engine: 'claude', trustWindowMs: 30000, readyGraceMs: 3000, now: clock.now,
+  });
+
+  // リセット前に、単体では信頼確認の文脈に一致しない断片（cd 行のエコーの前半）が
+  // バッファに蓄積される。
+  clock.advance(10);
+  pty.emit('cd -- ');
+  assert.deepEqual(pty.writes, []);
+
+  // main.js の restartAgentInTerminal は起動コマンドの書き込み直後にここで
+  // resetBuffer() を呼び、それまでに蓄積された断片を捨てる。
+  responder.resetBuffer();
+
+  // リセット後に届く、それ単体でも信頼確認の文脈に一致しない断片。resetBuffer() が
+  // 無ければ直前の断片と結合して信頼確認の文脈に見える文字列になりうるが、
+  // リセット済みのためこの断片だけで評価され、誤検知しない。
+  clock.advance(10);
+  pty.emit("'/tmp/some project'\r\n");
+  assert.deepEqual(pty.writes, []);
+
+  // trustHandled はまだ未発火のため、本物の信頼確認プロンプトには引き続き応答できる。
+  clock.advance(10);
+  pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
+  assert.deepEqual(pty.writes, ['\r']);
+});
+
+test('LOW-G（回帰確認）: resetBuffer() を attach 直後（データ到着前）に呼んでも、通常の検知は妨げない', () => {
+  const pty = createFakePty();
+  const clock = createFakeClock(0);
+
+  // main.js の実際の呼び出しタイミング（attach → cd 書き込み → 起動コマンド書き込み →
+  // resetBuffer()）はすべて同期的に進み、この時点ではまだ何もバッファに届いていない。
+  // resetBuffer() をここで呼んでも、それ自体が以後の正常な検知を妨げないことを確認する。
+  const responder = attachTrustAutoResponder(pty, {
+    spawnTime: 0, engine: 'claude', trustWindowMs: 30000, readyGraceMs: 3000, now: clock.now,
+  });
+  responder.resetBuffer();
+
+  clock.advance(100);
+  pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
+  assert.deepEqual(pty.writes, ['\r']);
+});

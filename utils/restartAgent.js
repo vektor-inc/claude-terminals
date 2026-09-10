@@ -5,6 +5,16 @@ const KILL_SIGNAL = 'SIGKILL';
 const DEFAULT_TERM_GRACE_MS = 1500;
 const DEFAULT_STOP_TIMEOUT_MS = 5000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
+// lstart（起動時刻）を「同一プロセスかどうか」の判定に使う際の許容幅（ミリ秒）。
+// macOS の ps は起動時刻をカーネルが保持する値から直接出すため呼び出しごとに安定するが、
+// Linux の procps は lstart を「/proc/stat の btime + プロセスの起動 tick」から呼び出しの
+// たびに計算し直す。btime は壁時計と単調時計のオフセット由来のため、NTP のステップ補正・
+// スリープ復帰・手動での時刻変更が起きると、追跡中の全 PID の起動時刻文字列が一斉にずれ
+// うる（安藤の指摘・MEDIUM-A）。厳密一致ではなく、この許容幅以内なら同一プロセスとみなす。
+// PID の再利用は起動時刻が大きく離れるため、この許容幅では誤認しない。
+// 停止操作 1 回の上限（DEFAULT_STOP_TIMEOUT_MS）と同じ幅に揃えている
+// （停止操作が続いている間に起こりうる時刻のずれの上限として妥当なため）。
+const DEFAULT_LSTART_TOLERANCE_MS = DEFAULT_STOP_TIMEOUT_MS;
 
 // ペインごとの AI 世代番号を main プロセスだけで保持する。
 // renderer 由来の状態へ依存させないことで、再起動完了との更新順を一意にする。
@@ -83,30 +93,52 @@ function validateRestartAgentRequest(value, validators) {
 
 // ps の pid/ppid/lstart 一覧を、子孫探索・同一性の再照合・生存確認に使う索引へ変換する。
 // lstart（起動時刻）は、PID が再利用された別プロセスや、孤児化して reaper に引き取られた
-// プロセスを、同じ PID の「同じプロセス」と誤認しないための鍵として使う（parentByPid だけでは
-// 親が変わった理由が「再利用」なのか「孤児化」なのか区別できないため）。
+// プロセスを、同じ PID の「同じプロセス」と誤認しないための鍵として使う。
+// parentByPid（親 PID 索引）はどこからも参照されなくなったため持たない（安藤の指摘・LOW-C）。
 function parseProcessTable(output) {
   const childrenByParent = new Map();
-  const parentByPid = new Map();
   const livePids = new Set();
   const startedAtByPid = new Map();
   for (const line of String(output).split('\n')) {
     // lstart は曜日・月・日・時刻・年を含む文字列（例: "Wed Sep 10 18:20:00 2026"）で、
-    // 内部に空白を含むため末尾までまとめて 1 グループとして捉える。日時として解釈せず、
-    // 同一プロセスかどうかを判定する不透明な識別子としてのみ文字列比較に使う。
+    // 内部に空白を含むため末尾までまとめて 1 グループとして捉える。呼び出し側（main.js）が
+    // LC_ALL=C を指定して ps を起動するため、この書式で安定する（ロケール依存で崩れない）。
     const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     if (!match) continue;
     const pid = Number(match[1]);
     const parentPid = Number(match[2]);
     const startedAt = match[3];
     livePids.add(pid);
-    parentByPid.set(pid, parentPid);
     startedAtByPid.set(pid, startedAt);
     const children = childrenByParent.get(parentPid) || [];
     children.push(pid);
     childrenByParent.set(parentPid, children);
   }
-  return { childrenByParent, parentByPid, livePids, startedAtByPid };
+  return { childrenByParent, livePids, startedAtByPid };
+}
+
+/**
+ * 2つの lstart 生値（ps の "pid=,ppid=,lstart=" 出力に含まれる起動時刻文字列）が
+ * 「同一プロセス」とみなせるかどうかを判定する。単純な文字列の厳密一致ではなく、
+ * Date.parse した時刻の差が toleranceMs 以内かどうかで比較する（安藤の指摘・MEDIUM-A。
+ * Linux の procps は呼び出しのたびに lstart を計算し直すため、システム時刻の補正の
+ * 影響でわずかにずれることがある。冒頭の DEFAULT_LSTART_TOLERANCE_MS のコメント参照）。
+ *
+ * どちらか一方でもパースできない場合は fail-closed（＝「別プロセスだと断定できない」
+ * として true を返す）。呼び出し側（stopAgentChildren）はこの結果を「まだ追跡を続ける
+ * （kill 対象に残す）」判定に使うため、パース不能を理由に誤って追跡から外さないように
+ * するための安全側の既定。
+ *
+ * @param {string} rawA
+ * @param {string} rawB
+ * @param {number} toleranceMs
+ * @returns {boolean}
+ */
+function isSameProcessStart(rawA, rawB, toleranceMs) {
+  const msA = Date.parse(rawA);
+  const msB = Date.parse(rawB);
+  if (!Number.isFinite(msA) || !Number.isFinite(msB)) return true;
+  return Math.abs(msA - msB) <= toleranceMs;
 }
 
 function collectDescendantPids(rootPid, childrenByParent) {
@@ -163,14 +195,15 @@ async function stopAgentChildren(shellPid, dependencies, options = {}) {
   const termGraceMs = options.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const lstartToleranceMs = options.lstartToleranceMs ?? DEFAULT_LSTART_TOLERANCE_MS;
   const now = dependencies.now || Date.now;
   const wait = dependencies.wait || delay;
   // PID の同一性は「PID + 起動時刻（lstart）」で判定する。親 PID の一致や固定 PID（1）への
   // 決め打ちには頼らない。reaper（孤児を引き取るプロセス）の PID は環境によって異なり
   // （例: Linux の `systemd --user` セッションでは 1 ではなくユーザーマネージャの PID になる）、
   // 親 PID だけを見ていると「孤児化して reaper に引き取られた既知の子」を「無関係な別プロセス」
-  // と誤認して追跡から外してしまう。起動時刻まで一致していれば、親がどこへ変わっても
-  // 同じプロセスとして追跡を続けてよい。
+  // と誤認して追跡から外してしまう。起動時刻が isSameProcessStart の許容幅内で一致していれば、
+  // 親がどこへ変わっても同じプロセスとして追跡を続けてよい。
   const targets = new Map(); // pid -> 発見時の起動時刻（lstart）
   const operationStartedAt = now();
 
@@ -190,7 +223,7 @@ async function stopAgentChildren(shellPid, dependencies, options = {}) {
     }
 
     const remaining = [...targets.keys()].filter((pid) => (
-      livePids.has(pid) && startedAtByPid.get(pid) === targets.get(pid)
+      livePids.has(pid) && isSameProcessStart(startedAtByPid.get(pid), targets.get(pid), lstartToleranceMs)
     ));
     if (remaining.length === 0) return true;
 
@@ -213,12 +246,14 @@ module.exports = {
   DEFAULT_TERM_GRACE_MS,
   DEFAULT_STOP_TIMEOUT_MS,
   DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_LSTART_TOLERANCE_MS,
   createAgentGenerationStore,
   mergeAgentGenerations,
   validateRestartAgentRequest,
   parseProcessTable,
   collectDescendantPids,
   stopSignalForElapsed,
+  isSameProcessStart,
   quoteShellArgument,
   stopAgentChildren,
 };

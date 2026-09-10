@@ -108,6 +108,10 @@ const restartAgentOperations = new Map();
 // 開始する前に前回分を確実に解除する（restartAgentOperations の直列化により、同じ termId
 // への呼び出しはこの Map への set/get も含めて重ならない）。
 const restartTrustResponders = new Map();
+// terminal:create が登録した「ペイン作成時の信頼確認 watcher を無効化する」関数を
+// termId ごとに保持する（安藤の指摘・MEDIUM-E）。restartAgentInTerminal は自分の
+// responder を取り付ける前にこれを呼び、作成時の watcher とのプロンプト二重応答を防ぐ。
+const paneCreationTrustWatchers = new Map();
 // 直列化の待ち行列に積まれたまま応答が返らない状態を避けるための、リクエスト単位の上限。
 // /api/new-pane の待機タイムアウトと揃えている。
 const RESTART_AGENT_QUEUE_TIMEOUT_MS = 15000;
@@ -1556,6 +1560,14 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
 
       stopWatchingIfDone(now);
     };
+
+    // restartAgentInTerminal が同じ pty へ来た場合、この監視をまだ武装したまま放置すると、
+    // 作成時の watcher と再起動側の responder（utils/trustPromptWatcher.js）が同じ信頼確認
+    // プロンプトへ二重に Enter を送りうる（安藤の指摘・MEDIUM-E）。restartAgentInTerminal が
+    // 自分の監視を取り付ける直前にこの関数を呼び、作成時の監視（promptWatcher）を無効化
+    // できるようにしておく。initialCommand 関連のタイマーには触れない（再起動後は
+    // isFirstTerminal の initialCommand 自体が既に送信済みか無関係になっているため）。
+    paneCreationTrustWatchers.set(id, () => { promptWatcher = null; });
   }
 
   ptyProcess.onData((data) => {
@@ -1578,6 +1590,7 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
     const restartTrustResponder = restartTrustResponders.get(id);
     if (restartTrustResponder) restartTrustResponder.dispose();
     restartTrustResponders.delete(id);
+    paneCreationTrustWatchers.delete(id);
     if (win && !win.isDestroyed()) {
       win.webContents.send('terminal:exit', id);
     }
@@ -1628,6 +1641,12 @@ ipcMain.on('terminal:kill', (event, id) => {
     ptys.delete(id);
     agentGenerations.delete(id);
     restartAgentOperations.delete(id);
+    // ptyProcess.onExit 側でも同じ後始末をするが、ここで管理している Map と食い違わない
+    // よう、削除する Map を揃えておく（安藤の指摘・LOW-F）。
+    const restartTrustResponder = restartTrustResponders.get(id);
+    if (restartTrustResponder) restartTrustResponder.dispose();
+    restartTrustResponders.delete(id);
+    paneCreationTrustWatchers.delete(id);
   }
 });
 
@@ -1725,10 +1744,16 @@ async function listProcessesForRestart() {
   // `ps` の引数は macOS / Linux の両方で利用できる共通部分に限定する。lstart（起動時刻）は
   // PID の同一性判定（utils/restartAgent.js 側で使用）に使う。両 OS の ps で共通に使える。
   // shell 経由では起動せず、外部入力がコマンドとして解釈される経路を作らない。
+  //
+  // LC_ALL=C を明示する（安藤の指摘・MEDIUM-A）: 未指定だと lstart の書式（曜日・月名など）が
+  // 呼び出し環境のロケールに左右され、utils/restartAgent.js の isSameProcessStart が
+  // Date.parse できない値になりうる。C ロケールなら "Wed Sep 10 18:20:00 2026" 形式に
+  // 固定され、両 OS の ps・Date.parse の双方で安定する。
   const { stdout } = await execFileAsync('ps', ['-A', '-o', 'pid=,ppid=,lstart='], {
     maxBuffer: 1024 * 1024,
     timeout: 2000,
     killSignal: 'SIGKILL',
+    env: { ...process.env, LC_ALL: 'C' },
   });
   return stdout;
 }
@@ -1758,6 +1783,17 @@ async function restartAgentInTerminal(ptyProcess, request) {
   // 前回の restartAgentInTerminal が完了済みであることが保証されている）。
   const previousTrustResponder = restartTrustResponders.get(request.termId);
   if (previousTrustResponder) previousTrustResponder.dispose();
+
+  // terminal:create（ペイン作成時）の watcher がまだ武装している間に再起動が入ると、
+  // 同じ信頼確認プロンプトへ作成時の watcher とこの responder の両方が Enter を送りうる
+  // （安藤の指摘・MEDIUM-E）。自分の監視を取り付ける前に、作成時の watcher を無効化する。
+  // 1度無効化すれば以後の再起動では何もしない（Map からも削除し、二度と再武装しない）。
+  const disarmPaneCreationWatcher = paneCreationTrustWatchers.get(request.termId);
+  if (disarmPaneCreationWatcher) {
+    disarmPaneCreationWatcher();
+    paneCreationTrustWatchers.delete(request.termId);
+  }
+
   const restartSpawnTime = performance.now();
   const trustResponder = attachTrustAutoResponder(ptyProcess, {
     spawnTime: restartSpawnTime,
@@ -1779,6 +1815,17 @@ async function restartAgentInTerminal(ptyProcess, request) {
     console.warn(`${LOG_PREFIX} model is ignored for engine '${request.engine}'`);
   }
   ptyProcess.write(`${command}\r`);
+
+  // responder は cd の書き込みより前に取り付けているため、シェルがエコーバックする
+  // `cd` 行（cwd のディレクトリ名を含む）がバッファに残っている可能性がある。
+  // ディレクトリ名がたまたま信頼確認の文言を含んでいた場合、本物のプロンプトが出る前に
+  // 誤って Enter を送り、一発限りの trustHandled を使い切ってしまう（安藤の指摘・LOW-G）。
+  // 起動コマンドの書き込みが終わった直後（＝実際の CLI 出力が届き始めるより確実に前）に
+  // バッファを一度空にし、以後の判定にエコー行を持ち越さないようにする。
+  // attach の位置（cd の書き込みより前）は変えない。逆順にすると起動直後の描画バーストを
+  // 取りこぼす（安藤の指摘）。
+  trustResponder.resetBuffer();
+
   return true;
 }
 
@@ -2653,10 +2700,24 @@ function startHttpApi() {
               res.end(JSON.stringify({ error: 'timeout waiting for previous restart-agent operation' }));
               return;
             }
-            await Promise.race([
-              previousOperation.catch(() => {}),
-              new Promise((resolve) => setTimeout(resolve, remainingMs)),
-            ]);
+            // setTimeout 側は「待ち行列全体の残り時間」を測るためだけのタイマーで、
+            // 先行処理が先に終わった場合は不要になる。clearTimeout せずに抜けると
+            // remainingMs 分（最大 RESTART_AGENT_QUEUE_TIMEOUT_MS）残り続け、待ち行列の
+            // 段数だけ積み上がる（安藤の指摘・LOW-B）。タイマー ID を保持し、待機が
+            // 終わったら必ず片付ける。utils/trustPromptWatcher.js の safetyTimeoutId と
+            // 同じく unref() も付け、このタイマー自体がプロセスの終了を止めないようにする。
+            let queueWaitTimeoutId;
+            try {
+              await Promise.race([
+                previousOperation.catch(() => {}),
+                new Promise((resolve) => {
+                  queueWaitTimeoutId = setTimeout(resolve, remainingMs);
+                  if (typeof queueWaitTimeoutId.unref === 'function') queueWaitTimeoutId.unref();
+                }),
+              ]);
+            } finally {
+              clearTimeout(queueWaitTimeoutId);
+            }
           }
 
           const ptyProcess = ptys.get(request.termId);
