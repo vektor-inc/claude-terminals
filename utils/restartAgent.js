@@ -12,9 +12,12 @@ const DEFAULT_POLL_INTERVAL_MS = 100;
 // スリープ復帰・手動での時刻変更が起きると、追跡中の全 PID の起動時刻文字列が一斉にずれ
 // うる（安藤の指摘・MEDIUM-A）。厳密一致ではなく、この許容幅以内なら同一プロセスとみなす。
 // PID の再利用は起動時刻が大きく離れるため、この許容幅では誤認しない。
-// 停止操作 1 回の上限（DEFAULT_STOP_TIMEOUT_MS）と同じ幅に揃えている
-// （停止操作が続いている間に起こりうる時刻のずれの上限として妥当なため）。
-const DEFAULT_LSTART_TOLERANCE_MS = DEFAULT_STOP_TIMEOUT_MS;
+// DEFAULT_STOP_TIMEOUT_MS（停止操作 1 回の上限）とは目的が異なる独立した値として持つ
+// （安藤の指摘・LOW-2）。停止タイムアウトを将来伸ばしても、プロセス同一視の許容幅が
+// 黙って一緒に広がらないようにするため。lstart の想定されるずれ幅（NTP のステップ補正・
+// procps の再計算誤差）に対して余裕を持たせつつ、PID 再利用との取り違えを避けられる
+// 範囲として 2000ms を既定にしている。
+const DEFAULT_LSTART_TOLERANCE_MS = 2000;
 
 // ペインごとの AI 世代番号を main プロセスだけで保持する。
 // renderer 由来の状態へ依存させないことで、再起動完了との更新順を一意にする。
@@ -117,6 +120,12 @@ function parseProcessTable(output) {
   return { childrenByParent, livePids, startedAtByPid };
 }
 
+// isSameProcessStart のパース失敗を知らせる警告は、プロセス毎に一度だけ出す
+// （ps の書式が想定外の環境では毎回のポーリングで呼ばれうるため、毎回出すとログが
+// 溢れる。安藤の指摘・LOW-3）。この警告が一度も出ない環境では lstart 比較が正しく
+// 機能していることの目安にもなる。
+let hasWarnedAboutUnparsableLstart = false;
+
 /**
  * 2つの lstart 生値（ps の "pid=,ppid=,lstart=" 出力に含まれる起動時刻文字列）が
  * 「同一プロセス」とみなせるかどうかを判定する。単純な文字列の厳密一致ではなく、
@@ -127,7 +136,9 @@ function parseProcessTable(output) {
  * どちらか一方でもパースできない場合は fail-closed（＝「別プロセスだと断定できない」
  * として true を返す）。呼び出し側（stopAgentChildren）はこの結果を「まだ追跡を続ける
  * （kill 対象に残す）」判定に使うため、パース不能を理由に誤って追跡から外さないように
- * するための安全側の既定。
+ * するための安全側の既定。fail-closed に倒れると起動時刻による同一性判定が実質的に
+ * 無効化される（常に「同一」扱いになる）ため、想定外の ps 書式に気づけるよう、
+ * 最初の1回だけ console.warn する（安藤の指摘・LOW-3）。
  *
  * @param {string} rawA
  * @param {string} rawB
@@ -137,7 +148,17 @@ function parseProcessTable(output) {
 function isSameProcessStart(rawA, rawB, toleranceMs) {
   const msA = Date.parse(rawA);
   const msB = Date.parse(rawB);
-  if (!Number.isFinite(msA) || !Number.isFinite(msB)) return true;
+  if (!Number.isFinite(msA) || !Number.isFinite(msB)) {
+    if (!hasWarnedAboutUnparsableLstart) {
+      hasWarnedAboutUnparsableLstart = true;
+      console.warn(
+        `[restartAgent] failed to parse process start time (lstart) for comparison: ${JSON.stringify(rawA)} / ${JSON.stringify(rawB)}. `
+        + 'Falling back to fail-closed (treating as the same process); process-identity checks by start time are effectively disabled until the ps output format is fixed. '
+        + '(this warning is shown once per process)'
+      );
+    }
+    return true;
+  }
   return Math.abs(msA - msB) <= toleranceMs;
 }
 

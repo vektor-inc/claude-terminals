@@ -202,7 +202,8 @@ test('プロセス表: 循環する親子関係を与えても root（シェル�
 // 書式（例: "Wed Sep 10 18:20:00 2026"）に合わせた値を使う。プレースホルダのままだと
 // 両方とも Date.parse に失敗して fail-closed（常に「同一」）になり、区別の検証にならない。
 const LSTART_T0 = 'Wed Sep 10 18:20:00 2026';
-// 許容幅（既定 DEFAULT_LSTART_TOLERANCE_MS=5000ms）を明確に超える、5分後の時刻。
+// 以下のテストは許容幅を明示的に 5000ms で渡す（既定の DEFAULT_LSTART_TOLERANCE_MS とは
+// 独立。安藤の指摘・LOW-2）。5分後の時刻はその 5000ms を明確に超える。
 const LSTART_T1_FAR = 'Wed Sep 10 18:25:00 2026';
 // 許容幅（5000ms）以内の、2秒だけ後ろにずれた時刻。Linux で lstart を計算し直した際の
 // システム時刻補正の揺れを模す。
@@ -285,6 +286,37 @@ test('isSameProcessStart: どちらか一方でもパースできない場合は
   assert.equal(isSameProcessStart('not a date', LSTART_T0, 5000), true);
   assert.equal(isSameProcessStart(LSTART_T0, 'not a date', 5000), true);
   assert.equal(isSameProcessStart('garbage-a', 'garbage-b', 5000), true);
+});
+
+test('isSameProcessStart: パース失敗の警告は（何回パース失敗しても）1回だけ出す（安藤の指摘・LOW-3）', () => {
+  // ps の書式が想定外になると fail-closed（常に「同一」）へ倒れ、起動時刻による同一性
+  // 判定が実質的に無効化される。ログが一切出ないと気づけないため console.warn するが、
+  // ポーリングのたびに呼ばれうる関数のため、ログが溢れないよう最初の1回だけに絞る。
+  //
+  // 「最初の1回だけ」の判定はモジュール読み込み単位（require キャッシュ）で状態を持つため、
+  // 他のテストが先に isSameProcessStart のパース失敗を経験しているとここでの呼び出しが
+  // 2回目以降になってしまい、実行順に依存した壊れやすいテストになる。それを避けるため、
+  // require キャッシュを一度破棄して、このテスト専用のまっさらなモジュールインスタンスを
+  // 読み込み直す。
+  const modulePath = require.resolve('../utils/restartAgent');
+  delete require.cache[modulePath];
+  const fresh = require(modulePath);
+  // 以後の require（他のテストファイルを含む）に影響しないよう、使い終わったら
+  // キャッシュを元の状態（このファイル冒頭の require で入った状態）へ戻しておく。
+  delete require.cache[modulePath];
+  require(modulePath);
+
+  const originalWarn = console.warn;
+  const warnCalls = [];
+  console.warn = (...args) => { warnCalls.push(args); };
+  try {
+    assert.equal(fresh.isSameProcessStart('not a date', LSTART_T0, 5000), true);
+    assert.equal(fresh.isSameProcessStart(LSTART_T0, 'not a date', 5000), true);
+    assert.equal(fresh.isSameProcessStart('garbage-a', 'garbage-b', 5000), true);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(warnCalls.length, 1);
 });
 
 test('子プロセス停止: 起動時刻の差が許容幅内（クロックのわずかな揺れ）なら追跡を続け、消滅確認後に成功する', async () => {

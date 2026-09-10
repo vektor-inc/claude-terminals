@@ -320,16 +320,28 @@ test('MEDIUM-E: 再起動が一度も起きないペイン相当（単独の監�
   assert.deepEqual(pty.writes, ['\r']);
 });
 
-// ─── LOW-G: cd 行のエコーによる誤検知と resetBuffer() ──────────────────────────────
+// ─── LOW-G: cd 行のエコーによる誤検知（既知の未対応事項）───────────────────────────
 // 安藤の指摘: responder は `cd -- '<cwd>'` の書き込みより前に取り付けられるため、
 // シェルがエコーバックする cd 行（cwd のディレクトリ名を含む）がバッファに入りうる。
 // ディレクトリ名が信頼確認の文言を含んでいた場合、本物のプロンプトが出る前に Enter を
-// 撃ち、一発限りの trustHandled を使い切ってしまう。trustGate.markTrustHandled() は
-// 一度発火すると戻せないため、resetBuffer() は「既に誤って発火してしまった後」を
-// 救う手段ではなく、「文字列が結合して誤検知を作る前に断つ」ための手段であることを
-// 踏まえてテストする。
+// 撃ち、一発限りの trustHandled を使い切ってしまう。
+//
+// かつてこの下のテストと対になる「LOW-G（修正）」テストが存在し、resetBuffer() で
+// 対策済みという体裁になっていた。しかし resetBuffer() は main.js の
+// restartAgentInTerminal から呼ばれる時点（attach から await を挟まない同期処理の末尾）
+// では、cd 行のエコーがまだ pty から返ってきておらずバッファが常に空のため、実効性が
+// 無かった（安藤の実機確認。node-pty の書き込みは setImmediate 経由でさらに後）。
+// 効いていない防御を「修正済み」として残すと後から読んだ人を誤らせるため、
+// resetBuffer() 自体（utils/trustPromptWatcher.js の attachTrustAutoResponder の戻り値）
+// と、そのテストを撤去した。
+//
+// 以下のテストは「バグが直った」ことの確認ではなく、「この事象は既知のまま未対応で
+// 残っている」ことを固定するためのテストである（対応しない理由は
+// utils/trustPromptWatcher.js の attachTrustAutoResponder の JSDoc を参照）。将来
+// 何らかの対策を入れる場合は、このテストが red になることをもって「直った」を
+// 確認してよい。
 
-test('LOW-G（問題の再現）: cd 行のエコー相当の文言だけで trustHandled を使い切り、以後の本物のプロンプトに応答できなくなる', () => {
+test('LOW-G（未対応・既知事象の固定）: cd 行のエコー相当の文言だけで trustHandled を使い切り、以後の本物のプロンプトに応答できなくなる', () => {
   const pty = createFakePty();
   const clock = createFakeClock(0);
 
@@ -347,54 +359,6 @@ test('LOW-G（問題の再現）: cd 行のエコー相当の文言だけで tru
   // もう応答できない（= ペインが静止したまま止まる、今回の HIGH 修正が消そうとした
   // 症状そのものが、ディレクトリ名で再現できてしまう）。
   clock.advance(10);
-  pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
-  assert.deepEqual(pty.writes, ['\r']);
-});
-
-test('LOW-G（修正）: resetBuffer() は、リセット前後の断片が結合して誤検知を作るのを防ぎ、本物のプロンプトには応答できる', () => {
-  const pty = createFakePty();
-  const clock = createFakeClock(0);
-
-  const responder = attachTrustAutoResponder(pty, {
-    spawnTime: 0, engine: 'claude', trustWindowMs: 30000, readyGraceMs: 3000, now: clock.now,
-  });
-
-  // リセット前に、単体では信頼確認の文脈に一致しない断片（cd 行のエコーの前半）が
-  // バッファに蓄積される。
-  clock.advance(10);
-  pty.emit('cd -- ');
-  assert.deepEqual(pty.writes, []);
-
-  // main.js の restartAgentInTerminal は起動コマンドの書き込み直後にここで
-  // resetBuffer() を呼び、それまでに蓄積された断片を捨てる。
-  responder.resetBuffer();
-
-  // リセット後に届く、それ単体でも信頼確認の文脈に一致しない断片。resetBuffer() が
-  // 無ければ直前の断片と結合して信頼確認の文脈に見える文字列になりうるが、
-  // リセット済みのためこの断片だけで評価され、誤検知しない。
-  clock.advance(10);
-  pty.emit("'/tmp/some project'\r\n");
-  assert.deepEqual(pty.writes, []);
-
-  // trustHandled はまだ未発火のため、本物の信頼確認プロンプトには引き続き応答できる。
-  clock.advance(10);
-  pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
-  assert.deepEqual(pty.writes, ['\r']);
-});
-
-test('LOW-G（回帰確認）: resetBuffer() を attach 直後（データ到着前）に呼んでも、通常の検知は妨げない', () => {
-  const pty = createFakePty();
-  const clock = createFakeClock(0);
-
-  // main.js の実際の呼び出しタイミング（attach → cd 書き込み → 起動コマンド書き込み →
-  // resetBuffer()）はすべて同期的に進み、この時点ではまだ何もバッファに届いていない。
-  // resetBuffer() をここで呼んでも、それ自体が以後の正常な検知を妨げないことを確認する。
-  const responder = attachTrustAutoResponder(pty, {
-    spawnTime: 0, engine: 'claude', trustWindowMs: 30000, readyGraceMs: 3000, now: clock.now,
-  });
-  responder.resetBuffer();
-
-  clock.advance(100);
   pty.emit(CLAUDE_CURRENT_TRUST_PROMPT);
   assert.deepEqual(pty.writes, ['\r']);
 });

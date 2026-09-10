@@ -1564,10 +1564,18 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
     // restartAgentInTerminal が同じ pty へ来た場合、この監視をまだ武装したまま放置すると、
     // 作成時の watcher と再起動側の responder（utils/trustPromptWatcher.js）が同じ信頼確認
     // プロンプトへ二重に Enter を送りうる（安藤の指摘・MEDIUM-E）。restartAgentInTerminal が
-    // 自分の監視を取り付ける直前にこの関数を呼び、作成時の監視（promptWatcher）を無効化
-    // できるようにしておく。initialCommand 関連のタイマーには触れない（再起動後は
-    // isFirstTerminal の initialCommand 自体が既に送信済みか無関係になっているため）。
-    paneCreationTrustWatchers.set(id, () => { promptWatcher = null; });
+    // 自分の監視を取り付ける直前にこの関数を呼び、作成時の監視の「信頼確認への自動 Enter」
+    // だけを無効化できるようにしておく。
+    //
+    // promptWatcher = null で監視全体を落とすと、信頼確認の自動応答だけでなく ready 検知と
+    // それに連動する initialCommand の送信経路まで一緒に止まってしまう（安藤の指摘・LOW-1）。
+    // 「最初のペイン」かつ「initialCommand 設定あり」かつ「ペイン作成から短時間で再起動」の
+    // 場合、initialCommand が ready 検知経由の送信から WATCH_TIMEOUT_MS 後の盲打ちフォール
+    // バックへ降格してしまう（promptWatcherTimeoutId 自体は生き残るため送信は起きるが、
+    // 早く送れるはずの経路を失う）。trustGate.markTrustHandled() は自動 Enter 送信だけを
+    // 封じ、ready 検知・initialCommand 送信・監視終了判定（shouldStopWatching）はそのまま
+    // 生かす。
+    paneCreationTrustWatchers.set(id, () => { trustGate.markTrustHandled(); });
   }
 
   ptyProcess.onData((data) => {
@@ -1786,7 +1794,8 @@ async function restartAgentInTerminal(ptyProcess, request) {
 
   // terminal:create（ペイン作成時）の watcher がまだ武装している間に再起動が入ると、
   // 同じ信頼確認プロンプトへ作成時の watcher とこの responder の両方が Enter を送りうる
-  // （安藤の指摘・MEDIUM-E）。自分の監視を取り付ける前に、作成時の watcher を無効化する。
+  // （安藤の指摘・MEDIUM-E）。自分の監視を取り付ける前に、作成時の watcher の自動 Enter
+  // 送信だけを無効化する（ready 検知・initialCommand 送信は止めない。安藤の指摘・LOW-1）。
   // 1度無効化すれば以後の再起動では何もしない（Map からも削除し、二度と再武装しない）。
   const disarmPaneCreationWatcher = paneCreationTrustWatchers.get(request.termId);
   if (disarmPaneCreationWatcher) {
@@ -1816,15 +1825,15 @@ async function restartAgentInTerminal(ptyProcess, request) {
   }
   ptyProcess.write(`${command}\r`);
 
-  // responder は cd の書き込みより前に取り付けているため、シェルがエコーバックする
-  // `cd` 行（cwd のディレクトリ名を含む）がバッファに残っている可能性がある。
-  // ディレクトリ名がたまたま信頼確認の文言を含んでいた場合、本物のプロンプトが出る前に
-  // 誤って Enter を送り、一発限りの trustHandled を使い切ってしまう（安藤の指摘・LOW-G）。
-  // 起動コマンドの書き込みが終わった直後（＝実際の CLI 出力が届き始めるより確実に前）に
-  // バッファを一度空にし、以後の判定にエコー行を持ち越さないようにする。
-  // attach の位置（cd の書き込みより前）は変えない。逆順にすると起動直後の描画バーストを
-  // 取りこぼす（安藤の指摘）。
-  trustResponder.resetBuffer();
+  // 既知の未対応事項（issue #392・安藤の指摘・LOW-G）: responder は cd の書き込みより前に
+  // 取り付けているため、シェルがエコーバックする `cd` 行（cwd のディレクトリ名を含む）が
+  // バッファに残る。cwd のディレクトリ名がたまたま信頼確認の文言を含んでいた場合、本物の
+  // プロンプトが出る前に誤って Enter を送り、一発限りの trustHandled を使い切ってしまう
+  // ことがある。かつてここで trustResponder.resetBuffer() を呼んで対策していたが、attach
+  // からこの行までは await を挟まない同期処理であり、エコーが届くのはさらに後（node-pty の
+  // 書き込みは setImmediate 経由）のため、resetBuffer() の時点ではバッファは常に空で
+  // 実効性が無かった（安藤の実機確認）。詳細は utils/trustPromptWatcher.js の
+  // attachTrustAutoResponder の JSDoc を参照。対応不要の判断についても同所参照。
 
   return true;
 }

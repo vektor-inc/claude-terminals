@@ -73,12 +73,23 @@ function getReadyPatternForEngine(engine) {
  *   テストから実時間を待たずに制御できるようにするための注入口。
  * @param {(message: string) => void} [options.log] - 検知・送信時のログ出力先。既定は
  *   何もしない関数（呼び出し側で LOG_PREFIX 等を付けたい場合に渡す）。
- * @returns {{ dispose: () => void, resetBuffer: () => void }} 監視を止めるための
- *   disposable（dispose は冪等・複数回呼んでも安全）と、蓄積済みバッファを空にする
- *   resetBuffer。resetBuffer は、attach の後に呼び出し側が pty へ書き込む行（例:
- *   restart-agent の `cd` コマンド）のエコーがバッファへ残ったまま次の判定に混ざらない
- *   よう、そのエコーを書き終えた直後に呼ぶための口（issue #392 の追加対応・安藤の
- *   指摘・LOW-G）。
+ * @returns {{ dispose: () => void }} 監視を止めるための disposable（dispose は冪等・
+ *   複数回呼んでも安全）。
+ *
+ * 既知の未対応事項（issue #392・安藤の指摘・LOW-G）: attach は呼び出し側が pty へ
+ * 書き込む行（restart-agent の場合は `cd` コマンド）より前に行われるため、シェルが
+ * エコーバックする cd 行（cwd のディレクトリ名を含む）がバッファに入りうる。cwd の
+ * ディレクトリ名がたまたま信頼確認の文言を含んでいた場合、本物のプロンプトが出る前に
+ * 誤って Enter を送り、一発限りの trustHandled を使い切ってしまう可能性がある。
+ * かつてこのモジュールは対策として resetBuffer() を提供していたが、呼び出し側
+ * （main.js の restartAgentInTerminal）の attach からその呼び出しまでは await を挟まない
+ * 完全な同期処理であり、エコーが届くのはさらに後（node-pty の書き込みは setImmediate
+ * 経由）だったため、resetBuffer() を呼ぶ時点ではバッファは常に空で、実効性が無かった
+ * （安藤の実機確認）。効いていない防御をコード上に残すと「対応済み」に見えてしまうため
+ * 撤去した。実害は「自動 Enter が空振りし、手動で1回 Enter を押す必要が出る」という
+ * 安全側の失敗であり、確実に塞ごうとするとエコー文字列の分断・エコーしないシェル設定
+ * 等の新しい失敗経路を増やすため、この PR の主題（信頼確認プロンプトを経由していなかった
+ * HIGH の修正）に対して釣り合わないと判断し、未対応のまま残している。
  */
 function attachTrustAutoResponder(ptyProcess, options = {}) {
   const {
@@ -148,9 +159,6 @@ function attachTrustAutoResponder(ptyProcess, options = {}) {
 
   return {
     dispose,
-    resetBuffer() {
-      buffer = '';
-    },
   };
 }
 
