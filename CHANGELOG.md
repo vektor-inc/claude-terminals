@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.62.1
+
+- [ デザイン不具合修正 ] タスク編集パネルの項目名の欄の幅が足りず「/code-review」が2行に折り返して読み取りづらくなる不具合を修正（[#391](https://github.com/vektor-inc/vk-terminals/issues/391)）
+
 ## 1.62.0
 
 - [ 機能追加 ] タスク編集パネルのプルダウンを、宣言側が項目ごとに指定した見出し（`section`）でグループ化して描画できるよう対応を追加（実際に見出しが表示されるのは VK Orchestrator 側の宣言が対応してから）（[#389](https://github.com/vektor-inc/vk-terminals/issues/389)）
