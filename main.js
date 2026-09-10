@@ -51,6 +51,13 @@ const {
   isValidEngine,
   buildEngineAwareLaunchCommand,
 } = require('./renderer/claudeModel');
+const {
+  createAgentGenerationStore,
+  mergeAgentGenerations,
+  validateRestartAgentRequest,
+  quoteShellArgument,
+  stopAgentChildren,
+} = require('./utils/restartAgent');
 const { resolveInstanceId, buildHealthResponse } = require('./utils/instanceId');
 const {
   describeSettingsValues,
@@ -86,6 +93,10 @@ const execFileAsync = promisify(execFile);
 
 let win;
 const ptys = new Map();
+const agentGenerations = createAgentGenerationStore();
+// 同じペインへの同時再起動は先行処理の完了後に世代を再照合する。
+// これが無いと同じ expectedGeneration の2要求が両方通り、後発が先発の新しい AI を止めうる。
+const restartAgentOperations = new Map();
 let nextId = 1;
 let firstTerminalCreated = false;
 
@@ -1557,12 +1568,15 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
       promptWatcherTimeoutId = null;
     }
     ptys.delete(id);
+    agentGenerations.delete(id);
+    restartAgentOperations.delete(id);
     if (win && !win.isDestroyed()) {
       win.webContents.send('terminal:exit', id);
     }
   });
 
   ptys.set(id, ptyProcess);
+  agentGenerations.initialize(id, !noClaude);
 
   // 起動後に自動で AI エンジンを実行（素のターミナルモード時はスキップ）
   // resolvedEngine が 'claude'（省略時含む）なら従来どおり options.model が指定されて
@@ -1604,6 +1618,8 @@ ipcMain.on('terminal:kill', (event, id) => {
   if (p) {
     try { p.kill(); } catch (e) {}
     ptys.delete(id);
+    agentGenerations.delete(id);
+    restartAgentOperations.delete(id);
   }
 });
 
@@ -1681,9 +1697,47 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 ipcMain.on('terminal:report-states', (event, states) => {
   cachedStates = states;
   // 状態ファイルに書き出し（非同期、エラーは無視）
-  const payload = JSON.stringify({ updatedAt: new Date().toISOString(), terminals: states }, null, 2);
+  const statesWithGenerations = mergeAgentGenerations(states, (termId) => agentGenerations.get(termId));
+  const payload = JSON.stringify({ updatedAt: new Date().toISOString(), terminals: statesWithGenerations }, null, 2);
   fs.writeFile(STATE_FILE, payload, 'utf8', () => {});
 });
+
+function isExistingDirectory(value) {
+  if (typeof value !== 'string' || !value) return false;
+  try {
+    return fs.statSync(value).isDirectory();
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function listProcessesForRestart() {
+  // `ps` の引数は macOS / Linux の両方で利用できる共通部分に限定する。
+  // shell 経由では起動せず、外部入力がコマンドとして解釈される経路を作らない。
+  const { stdout } = await execFileAsync('ps', ['-A', '-o', 'pid=,ppid='], { maxBuffer: 1024 * 1024 });
+  return stdout;
+}
+
+async function restartAgentInTerminal(ptyProcess, request) {
+  const stopped = await stopAgentChildren(ptyProcess.pid, {
+    platform: process.platform,
+    listProcesses: listProcessesForRestart,
+    killProcess: (pid, signal) => process.kill(pid, signal),
+  });
+  if (!stopped) return false;
+
+  // cwd は存在確認済みでも、この write までに名前が変わる可能性がある。
+  // `cd --` と単一引数クォートで解釈を固定し、失敗時にも別コマンドを注入させない。
+  if (request.cwd !== undefined) {
+    ptyProcess.write(`cd -- ${quoteShellArgument(request.cwd)}\r`);
+  }
+  const { command, modelIgnored } = buildEngineAwareLaunchCommand(request.engine, request.model);
+  if (modelIgnored) {
+    console.warn(`${LOG_PREFIX} model is ignored for engine '${request.engine}'`);
+  }
+  ptyProcess.write(`${command}\r`);
+  return true;
+}
 
 // ─── HTTP API ────────────────────────────────────────────────────────────────
 function startHttpApi() {
@@ -1930,10 +1984,16 @@ function startHttpApi() {
         Promise.resolve(getUsageUnified()).catch(() => null),
         Promise.resolve(getCodexUsageUnified()).catch(() => null),
       ]).then(([usage, codexUsage]) => {
+        // 世代番号は renderer に持たせず、main が管理する termId の記録を応答時に加える。
+        // cachedStates の既存キー・値は変更しないため、既存クライアントには additive。
+        const statesWithGenerations = mergeAgentGenerations(
+          cachedStates,
+          (termId) => agentGenerations.get(termId)
+        );
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({
           updatedAt: new Date().toISOString(),
-          terminals: cachedStates,
+          terminals: statesWithGenerations,
           usage,
           codexUsage,
           version: require('./package.json').version,
@@ -2486,6 +2546,87 @@ function startHttpApi() {
         if (requestedUseDefaults === true) payload.useDefaults = true;
         if (typeof requestedModel === 'string') payload.model = requestedModel;
         win.webContents.send('terminal:request-new-pane', payload);
+      });
+      return;
+    }
+
+    // POST /api/restart-agent
+    //   同じ PTY（ログインシェル）を残したまま、その配下の AI だけを停止確認して起動し直す。
+    //   expectedGeneration は別タスクへ入れ替わったペインの誤停止を防ぐ楽観ロックとして使う。
+    if (req.method === 'POST' && url.pathname === '/api/restart-agent') {
+      if (isForbiddenOrigin(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'forbidden origin' }));
+        return;
+      }
+      readJsonBody(req, res, 10 * 1024, async (body) => {
+        let parsed;
+        try {
+          parsed = JSON.parse(body);
+        } catch (_error) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
+          return;
+        }
+
+        const request = validateRestartAgentRequest(parsed, {
+          isValidEngine,
+          isValidModelForEngine,
+          isValidCwd: isExistingDirectory,
+        });
+        if (!request.ok) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: request.error }));
+          return;
+        }
+
+        // 同じ世代を指定した並行要求が来た場合、先行要求を待ってから再照合する。
+        // 待たずに両方を開始すると、後発要求が先発要求で起動した AI まで停止してしまう。
+        const previousOperation = restartAgentOperations.get(request.termId);
+        if (previousOperation) {
+          try { await previousOperation; } catch (_error) {}
+        }
+
+        const ptyProcess = ptys.get(request.termId);
+        if (!ptyProcess) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `terminal ${request.termId} not found` }));
+          return;
+        }
+        const currentGeneration = agentGenerations.get(request.termId);
+        if (request.expectedGeneration !== currentGeneration) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'generation mismatch', currentGeneration }));
+          return;
+        }
+
+        const operation = restartAgentInTerminal(ptyProcess, request);
+        restartAgentOperations.set(request.termId, operation);
+        try {
+          const stopped = await operation;
+          // 停止中に PTY 自体が終了した場合も成功扱いにはせず、世代を進めない。
+          if (!stopped || ptys.get(request.termId) !== ptyProcess) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'failed to stop agent' }));
+            return;
+          }
+          const generation = agentGenerations.increment(request.termId);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            termId: request.termId,
+            stopped: true,
+            generation,
+          }));
+        } catch (error) {
+          console.error(`${LOG_PREFIX} restart-agent failed for terminal ${request.termId}:`, error.message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'failed to stop agent' }));
+        } finally {
+          if (restartAgentOperations.get(request.termId) === operation) {
+            restartAgentOperations.delete(request.termId);
+          }
+        }
       });
       return;
     }
