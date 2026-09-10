@@ -18,6 +18,11 @@ const {
   READY_GRACE_MS: DEFAULT_READY_GRACE_MS,
   resolvePositiveFiniteMs,
 } = require('./utils/trustPromptGate');
+// 信頼確認プロンプトへの自動応答を、ペイン作成時（terminal:create）と再起動時
+// （POST /api/restart-agent）の両方から同じ判定で使うための共通配線（issue #392）。
+// getReadyPatternForEngine は「起動完了検知」の正規表現選択、attachTrustAutoResponder は
+// pty の出力を読んで trustPromptGate へ渡し、許可されたときだけ Enter を書き込む監視。
+const { getReadyPatternForEngine, attachTrustAutoResponder } = require('./utils/trustPromptWatcher');
 // 宣言的ウィジェット（tasks-widget.json）契約の共有ロジック（#229 / vk-orchestrator#182）。
 // タスクのドメイン語彙（遷移マトリクス・ラベル・優先度など）はこのプロセスに持たず、
 // orchestrator が書き出す宣言を検証・中継するだけの汎用実装にする。
@@ -51,6 +56,13 @@ const {
   isValidEngine,
   buildEngineAwareLaunchCommand,
 } = require('./renderer/claudeModel');
+const {
+  createAgentGenerationStore,
+  mergeAgentGenerations,
+  validateRestartAgentRequest,
+  quoteShellArgument,
+  stopAgentChildren,
+} = require('./utils/restartAgent');
 const { resolveInstanceId, buildHealthResponse } = require('./utils/instanceId');
 const {
   describeSettingsValues,
@@ -86,6 +98,23 @@ const execFileAsync = promisify(execFile);
 
 let win;
 const ptys = new Map();
+const agentGenerations = createAgentGenerationStore();
+// 同じペインへの同時再起動は先行処理の完了後に世代を再照合する。
+// これが無いと同じ expectedGeneration の2要求が両方通り、後発が先発の新しい AI を止めうる。
+const restartAgentOperations = new Map();
+// 再起動後の信頼確認プロンプト自動応答（issue #392）の監視を termId ごとに保持する。
+// 同じペインへ短時間に複数回 restart-agent が呼ばれた場合、古い監視を残したままにすると
+// 新しい監視と時間窓が重なり、同じプロンプトに Enter を二重送信しうるため、次の再起動を
+// 開始する前に前回分を確実に解除する（restartAgentOperations の直列化により、同じ termId
+// への呼び出しはこの Map への set/get も含めて重ならない）。
+const restartTrustResponders = new Map();
+// terminal:create が登録した「ペイン作成時の信頼確認 watcher を無効化する」関数を
+// termId ごとに保持する（安藤の指摘・MEDIUM-E）。restartAgentInTerminal は自分の
+// responder を取り付ける前にこれを呼び、作成時の watcher とのプロンプト二重応答を防ぐ。
+const paneCreationTrustWatchers = new Map();
+// 直列化の待ち行列に積まれたまま応答が返らない状態を避けるための、リクエスト単位の上限。
+// /api/new-pane の待機タイムアウトと揃えている。
+const RESTART_AGENT_QUEUE_TIMEOUT_MS = 15000;
 let nextId = 1;
 let firstTerminalCreated = false;
 
@@ -1375,21 +1404,11 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
   // 想定より早く送られてしまう。resolvedEngine ごとに別パターンを使うことで、
   // Claude ペインには従来どおり CLAUDE_READY_PATTERN だけを適用する。
   //
-  // 三項演算子で分岐する（安藤の指摘 LOW・修正1）: 当初はオブジェクトマップ
-  // （{ claude: ..., codex: ... }）で分けていたが、これは renderer/claudeModel.js の
-  // ENGINE_LAUNCH_COMMANDS で今まさに塞いだのと同じ「素のオブジェクトリテラルへの
-  // 変数添字アクセス」だった。resolvedEngine は isValidEngine 済みで到達不能とはいえ、
-  // 仮に未検証の値が来ると Object.prototype 側のメンバー（関数）が返り、
-  // READY_PATTERN.test(buffer) が ptyProcess.onData のたびに TypeError を投げる
-  // （安藤の実測）。エンジンが 'claude' / 'codex' の2つしか無い現状では、素のオブジェクト
-  // アクセスを経由しない三項演算子の方が安全かつ素直。3つ目以降のエンジンを足す際は
-  // ここを見直すこと（未登録の engine は CLAUDE_READY_PATTERN へ倒れる＝安全側）。
-  const CLAUDE_READY_PATTERN = /\?\s*for\s*shortcuts|\?\s*to\s*show\s*shortcuts|for\s*shortcuts|Welcome to Claude|Try\s*["']?\/help|Bypass(ing)?\s*Permissions|accept edits/i;
-  // Codex（issue #367。codex-cli 0.147.0 実機確認）: 起動完了バナーに "OpenAI Codex" が
-  // 出る。vk-orchestrator 側の CODEX_READY_PATTERN（setup-entry-autostart.js）と同じ
-  // パターンを採用する。
-  const CODEX_READY_PATTERN = /OpenAI Codex/i;
-  const READY_PATTERN = resolvedEngine === 'codex' ? CODEX_READY_PATTERN : CLAUDE_READY_PATTERN;
+  // パターン自体の選択は utils/trustPromptWatcher.js の getReadyPatternForEngine へ
+  // 切り出した（issue #392）。POST /api/restart-agent 経由の再起動でも同じ「起動完了検知」
+  // 判定を使うため、ここと再起動側の2箇所に同じ選択ロジックを別々に持たないようにする
+  // （選択ルールの詳細・安全側の既定はそちらのコメント参照）。
+  const READY_PATTERN = getReadyPatternForEngine(resolvedEngine);
 
   const WATCH_TIMEOUT_MS = 10000;
 
@@ -1541,6 +1560,22 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
 
       stopWatchingIfDone(now);
     };
+
+    // restartAgentInTerminal が同じ pty へ来た場合、この監視をまだ武装したまま放置すると、
+    // 作成時の watcher と再起動側の responder（utils/trustPromptWatcher.js）が同じ信頼確認
+    // プロンプトへ二重に Enter を送りうる（安藤の指摘・MEDIUM-E）。restartAgentInTerminal が
+    // 自分の監視を取り付ける直前にこの関数を呼び、作成時の監視の「信頼確認への自動 Enter」
+    // だけを無効化できるようにしておく。
+    //
+    // promptWatcher = null で監視全体を落とすと、信頼確認の自動応答だけでなく ready 検知と
+    // それに連動する initialCommand の送信経路まで一緒に止まってしまう（安藤の指摘・LOW-1）。
+    // 「最初のペイン」かつ「initialCommand 設定あり」かつ「ペイン作成から短時間で再起動」の
+    // 場合、initialCommand が ready 検知経由の送信から WATCH_TIMEOUT_MS 後の盲打ちフォール
+    // バックへ降格してしまう（promptWatcherTimeoutId 自体は生き残るため送信は起きるが、
+    // 早く送れるはずの経路を失う）。trustGate.markTrustHandled() は自動 Enter 送信だけを
+    // 封じ、ready 検知・initialCommand 送信・監視終了判定（shouldStopWatching）はそのまま
+    // 生かす。
+    paneCreationTrustWatchers.set(id, () => { trustGate.markTrustHandled(); });
   }
 
   ptyProcess.onData((data) => {
@@ -1557,12 +1592,20 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
       promptWatcherTimeoutId = null;
     }
     ptys.delete(id);
+    agentGenerations.delete(id);
+    restartAgentOperations.delete(id);
+    // 再起動後の信頼確認プロンプト自動応答（issue #392）が残っていれば解除する。
+    const restartTrustResponder = restartTrustResponders.get(id);
+    if (restartTrustResponder) restartTrustResponder.dispose();
+    restartTrustResponders.delete(id);
+    paneCreationTrustWatchers.delete(id);
     if (win && !win.isDestroyed()) {
       win.webContents.send('terminal:exit', id);
     }
   });
 
   ptys.set(id, ptyProcess);
+  agentGenerations.initialize(id, !noClaude);
 
   // 起動後に自動で AI エンジンを実行（素のターミナルモード時はスキップ）
   // resolvedEngine が 'claude'（省略時含む）なら従来どおり options.model が指定されて
@@ -1604,6 +1647,14 @@ ipcMain.on('terminal:kill', (event, id) => {
   if (p) {
     try { p.kill(); } catch (e) {}
     ptys.delete(id);
+    agentGenerations.delete(id);
+    restartAgentOperations.delete(id);
+    // ptyProcess.onExit 側でも同じ後始末をするが、ここで管理している Map と食い違わない
+    // よう、削除する Map を揃えておく（安藤の指摘・LOW-F）。
+    const restartTrustResponder = restartTrustResponders.get(id);
+    if (restartTrustResponder) restartTrustResponder.dispose();
+    restartTrustResponders.delete(id);
+    paneCreationTrustWatchers.delete(id);
   }
 });
 
@@ -1681,9 +1732,111 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 ipcMain.on('terminal:report-states', (event, states) => {
   cachedStates = states;
   // 状態ファイルに書き出し（非同期、エラーは無視）
-  const payload = JSON.stringify({ updatedAt: new Date().toISOString(), terminals: states }, null, 2);
+  const statesWithGenerations = mergeAgentGenerations(states, (termId) => agentGenerations.get(termId));
+  const payload = JSON.stringify({ updatedAt: new Date().toISOString(), terminals: statesWithGenerations }, null, 2);
   fs.writeFile(STATE_FILE, payload, 'utf8', () => {});
 });
+
+async function isExistingDirectory(value) {
+  if (typeof value !== 'string' || !value) return false;
+  // PTY への write はキーストロークとして解釈されるため、制御文字はクォートへ渡さない。
+  if (/[\x00-\x1f\x7f]/.test(value)) return false;
+  try {
+    return (await fs.promises.stat(value)).isDirectory();
+  } catch (_error) {
+    return false;
+  }
+}
+
+async function listProcessesForRestart() {
+  // `ps` の引数は macOS / Linux の両方で利用できる共通部分に限定する。lstart（起動時刻）は
+  // PID の同一性判定（utils/restartAgent.js 側で使用）に使う。両 OS の ps で共通に使える。
+  // shell 経由では起動せず、外部入力がコマンドとして解釈される経路を作らない。
+  //
+  // LC_ALL=C を明示する（安藤の指摘・MEDIUM-A）: 未指定だと lstart の書式（曜日・月名など）が
+  // 呼び出し環境のロケールに左右され、utils/restartAgent.js の isSameProcessStart が
+  // Date.parse できない値になりうる。C ロケールなら "Wed Sep 10 18:20:00 2026" 形式に
+  // 固定され、両 OS の ps・Date.parse の双方で安定する。
+  const { stdout } = await execFileAsync('ps', ['-A', '-o', 'pid=,ppid=,lstart='], {
+    maxBuffer: 1024 * 1024,
+    timeout: 2000,
+    killSignal: 'SIGKILL',
+    env: { ...process.env, LC_ALL: 'C' },
+  });
+  return stdout;
+}
+
+async function restartAgentInTerminal(ptyProcess, request) {
+  const stopped = await stopAgentChildren(ptyProcess.pid, {
+    platform: process.platform,
+    listProcesses: listProcessesForRestart,
+    killProcess: (pid, signal) => process.kill(pid, signal),
+  });
+  if (!stopped) return false;
+
+  // 再起動後の AI にも、ペイン作成時（terminal:create）と同じ信頼確認プロンプト自動応答を
+  // 効かせる（issue #392 の追加対応。安藤の指摘・HIGH）。この仕組みが無いと、cwd を
+  // 初めて開くディレクトリへ切り替えて再起動した場合に、新しい AI が信頼確認画面で
+  // 静止したまま止まりうる。起点時刻（spawnTime）は「ペイン作成時刻」ではなく
+  // 「再起動した時刻」を使う。ここを終始 performance.now()（単調増加時計）にする理由は
+  // terminal:create の spawnTime と同じ（システム時刻の巻き戻りで時間窓が開きっぱなしに
+  // なるのを防ぐため）。
+  //
+  // 判定ロジック（時間窓・ready 猶予・isTrustPrompt）は utils/trustPromptGate.js を
+  // そのまま再利用しており（utils/trustPromptWatcher.js 経由）、ここで作り直していない。
+  //
+  // 同じペインへ短時間に複数回再起動された場合に古い監視が新しい監視と重なって同じ
+  // プロンプトへ Enter を二重送信しないよう、新しい監視を取り付ける前に前回分を解除する
+  // （restartAgentOperations による直列化で、同じ termId の呼び出しはここへ到達する時点で
+  // 前回の restartAgentInTerminal が完了済みであることが保証されている）。
+  const previousTrustResponder = restartTrustResponders.get(request.termId);
+  if (previousTrustResponder) previousTrustResponder.dispose();
+
+  // terminal:create（ペイン作成時）の watcher がまだ武装している間に再起動が入ると、
+  // 同じ信頼確認プロンプトへ作成時の watcher とこの responder の両方が Enter を送りうる
+  // （安藤の指摘・MEDIUM-E）。自分の監視を取り付ける前に、作成時の watcher の自動 Enter
+  // 送信だけを無効化する（ready 検知・initialCommand 送信は止めない。安藤の指摘・LOW-1）。
+  // 1度無効化すれば以後の再起動では何もしない（Map からも削除し、二度と再武装しない）。
+  const disarmPaneCreationWatcher = paneCreationTrustWatchers.get(request.termId);
+  if (disarmPaneCreationWatcher) {
+    disarmPaneCreationWatcher();
+    paneCreationTrustWatchers.delete(request.termId);
+  }
+
+  const restartSpawnTime = performance.now();
+  const trustResponder = attachTrustAutoResponder(ptyProcess, {
+    spawnTime: restartSpawnTime,
+    engine: request.engine,
+    trustWindowMs: RESOLVED_TRUST_WINDOW_MS,
+    readyGraceMs: RESOLVED_READY_GRACE_MS,
+    isAlive: () => ptys.get(request.termId) === ptyProcess,
+    log: (message) => console.log(`${LOG_PREFIX} ${message} (terminal ${request.termId})`),
+  });
+  restartTrustResponders.set(request.termId, trustResponder);
+
+  // cwd は制御文字を拒否して存在確認済みでも、この write までに名前が変わる可能性がある。
+  // 残る通常文字は `cd --` と単一引数クォートで一つの引数として扱う。
+  if (request.cwd !== undefined) {
+    ptyProcess.write(`cd -- ${quoteShellArgument(request.cwd)}\r`);
+  }
+  const { command, modelIgnored } = buildEngineAwareLaunchCommand(request.engine, request.model);
+  if (modelIgnored) {
+    console.warn(`${LOG_PREFIX} model is ignored for engine '${request.engine}'`);
+  }
+  ptyProcess.write(`${command}\r`);
+
+  // 既知の未対応事項（issue #392・安藤の指摘・LOW-G）: responder は cd の書き込みより前に
+  // 取り付けているため、シェルがエコーバックする `cd` 行（cwd のディレクトリ名を含む）が
+  // バッファに残る。cwd のディレクトリ名がたまたま信頼確認の文言を含んでいた場合、本物の
+  // プロンプトが出る前に誤って Enter を送り、一発限りの trustHandled を使い切ってしまう
+  // ことがある。かつてここで trustResponder.resetBuffer() を呼んで対策していたが、attach
+  // からこの行までは await を挟まない同期処理であり、エコーが届くのはさらに後（node-pty の
+  // 書き込みは setImmediate 経由）のため、resetBuffer() の時点ではバッファは常に空で
+  // 実効性が無かった（安藤の実機確認）。詳細は utils/trustPromptWatcher.js の
+  // attachTrustAutoResponder の JSDoc を参照。対応不要の判断についても同所参照。
+
+  return true;
+}
 
 // ─── HTTP API ────────────────────────────────────────────────────────────────
 function startHttpApi() {
@@ -1930,10 +2083,16 @@ function startHttpApi() {
         Promise.resolve(getUsageUnified()).catch(() => null),
         Promise.resolve(getCodexUsageUnified()).catch(() => null),
       ]).then(([usage, codexUsage]) => {
+        // 世代番号は renderer に持たせず、main が管理する termId の記録を応答時に加える。
+        // cachedStates の既存キー・値は変更しないため、既存クライアントには additive。
+        const statesWithGenerations = mergeAgentGenerations(
+          cachedStates,
+          (termId) => agentGenerations.get(termId)
+        );
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({
           updatedAt: new Date().toISOString(),
-          terminals: cachedStates,
+          terminals: statesWithGenerations,
           usage,
           codexUsage,
           version: require('./package.json').version,
@@ -2486,6 +2645,137 @@ function startHttpApi() {
         if (requestedUseDefaults === true) payload.useDefaults = true;
         if (typeof requestedModel === 'string') payload.model = requestedModel;
         win.webContents.send('terminal:request-new-pane', payload);
+      });
+      return;
+    }
+
+    // POST /api/restart-agent
+    //   同じ PTY（ログインシェル）を残したまま、その配下の AI だけを停止確認して起動し直す。
+    //   expectedGeneration は別タスクへ入れ替わったペインの誤停止を防ぐ楽観ロックとして使う。
+    if (req.method === 'POST' && url.pathname === '/api/restart-agent') {
+      if (isForbiddenOrigin(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'forbidden origin' }));
+        return;
+      }
+      readJsonBody(req, res, 10 * 1024, async (body) => {
+        // ここで捕まえられない例外は unhandled rejection になり、Node 20 以降の既定では
+        // プロセスごと落ちてしまう。想定外の分岐も 500 で返せるよう全体を try で囲む。
+        try {
+          let parsed;
+          try {
+            parsed = JSON.parse(body);
+          } catch (_error) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid JSON' }));
+            return;
+          }
+
+          const request = validateRestartAgentRequest(parsed, {
+            isValidEngine,
+            isValidModelForEngine,
+          });
+          if (!request.ok) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: request.error }));
+            return;
+          }
+          // cwd の実在確認は fs.promises.stat を使う非同期処理のため、同期の
+          // validateRestartAgentRequest では行わずここで await する。
+          if (request.cwd !== undefined && !(await isExistingDirectory(request.cwd))) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid cwd' }));
+            return;
+          }
+
+          // 同じペインへの並行要求が来た場合、先行処理が終わるたびに Map を読み直して待つ。
+          // 1回だけ待つ形だと、同じ先行処理にぶら下がった2件目以降が互いを認識できず、後発が
+          // 先発の起動した AI を停止してしまう。while ループは呼び出し側（このスコープ）に
+          // 直接置くこと。while ループ自体を別の async 関数へ切り出すと、ループを抜けてから
+          // 呼び出し元へ制御が戻るまでに 1 microtask 分の隙間ができ、その隙間で複数の待機者が
+          // 同時に「Map が空」と誤認する余地が生まれる（実際に発生することを確認済み）。
+          //
+          // 待ち行列に積まれた件数が増えるほど、末尾のリクエストは先行するすべての処理の
+          // 完了を待つため待ち時間が線形に伸びる。無期限に待たせず、呼び出し元が「詰まった」
+          // ことを検知できるよう、待ち行列全体にリクエスト単位の上限（/api/new-pane と同じ
+          // 秒数）を設ける。タイムアウトで打ち切った場合、このリクエストは何も停止・起動
+          // しておらず世代も進めていないため、そのまま 504 を返して終了してよい。
+          const queueDeadline = Date.now() + RESTART_AGENT_QUEUE_TIMEOUT_MS;
+          let previousOperation;
+          while ((previousOperation = restartAgentOperations.get(request.termId))) {
+            const remainingMs = queueDeadline - Date.now();
+            if (remainingMs <= 0) {
+              res.writeHead(504, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'timeout waiting for previous restart-agent operation' }));
+              return;
+            }
+            // setTimeout 側は「待ち行列全体の残り時間」を測るためだけのタイマーで、
+            // 先行処理が先に終わった場合は不要になる。clearTimeout せずに抜けると
+            // remainingMs 分（最大 RESTART_AGENT_QUEUE_TIMEOUT_MS）残り続け、待ち行列の
+            // 段数だけ積み上がる（安藤の指摘・LOW-B）。タイマー ID を保持し、待機が
+            // 終わったら必ず片付ける。utils/trustPromptWatcher.js の safetyTimeoutId と
+            // 同じく unref() も付け、このタイマー自体がプロセスの終了を止めないようにする。
+            let queueWaitTimeoutId;
+            try {
+              await Promise.race([
+                previousOperation.catch(() => {}),
+                new Promise((resolve) => {
+                  queueWaitTimeoutId = setTimeout(resolve, remainingMs);
+                  if (typeof queueWaitTimeoutId.unref === 'function') queueWaitTimeoutId.unref();
+                }),
+              ]);
+            } finally {
+              clearTimeout(queueWaitTimeoutId);
+            }
+          }
+
+          const ptyProcess = ptys.get(request.termId);
+          if (!ptyProcess) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `terminal ${request.termId} not found` }));
+            return;
+          }
+          const currentGeneration = agentGenerations.get(request.termId);
+          if (request.expectedGeneration !== currentGeneration) {
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'generation mismatch', currentGeneration }));
+            return;
+          }
+
+          const operation = restartAgentInTerminal(ptyProcess, request);
+          restartAgentOperations.set(request.termId, operation);
+          try {
+            const stopped = await operation;
+            // 停止中に PTY 自体が終了した場合も成功扱いにはせず、世代を進めない。
+            if (!stopped || ptys.get(request.termId) !== ptyProcess) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'failed to stop agent' }));
+              return;
+            }
+            const generation = agentGenerations.increment(request.termId);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true,
+              termId: request.termId,
+              stopped: true,
+              generation,
+            }));
+          } catch (error) {
+            console.error(`${LOG_PREFIX} restart-agent failed for terminal ${request.termId}:`, error.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'failed to stop agent' }));
+          } finally {
+            if (restartAgentOperations.get(request.termId) === operation) {
+              restartAgentOperations.delete(request.termId);
+            }
+          }
+        } catch (error) {
+          console.error(`${LOG_PREFIX} restart-agent unexpected error:`, error?.message || error);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'failed to stop agent' }));
+          }
+        }
       });
       return;
     }

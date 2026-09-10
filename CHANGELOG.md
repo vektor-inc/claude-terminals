@@ -1,5 +1,7 @@
 # Changelog
 
+- [ 機能追加 ] ペインを閉じずに AI の停止完了を確認して起動し直せる HTTP API を追加（実際に使われるのは VK Orchestrator 側の対応が入ってから）（[#392](https://github.com/vektor-inc/vk-terminals/issues/392)）
+
 ## 1.62.1
 
 - [ デザイン不具合修正 ] タスク編集パネルの項目名の欄の幅が足りず「/code-review」が2行に折り返して読み取りづらくなる不具合を修正（[#391](https://github.com/vektor-inc/vk-terminals/issues/391)）

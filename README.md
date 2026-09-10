@@ -608,7 +608,8 @@ curl -s http://127.0.0.1:13847/api/states \
       "lastOutputTime": 1713340800000,
       "lastInputTime": 1713340790000,
       "lastLines": "最近の出力15行分...",
-      "backgroundAgents": 0
+      "backgroundAgents": 0,
+      "agentGeneration": 1
     }
   }
 }
@@ -623,6 +624,7 @@ curl -s http://127.0.0.1:13847/api/states \
 | `status` | 表示用ステータス（`idle` / `running` / `waiting`） |
 | `lastOutputTime` | 最後に出力があった時刻（Unix ms） |
 | `lastInputTime` | 最後にユーザーが入力した時刻（Unix ms） |
+| `agentGeneration` | ペイン内で起動した AI の世代番号。AI 起動ペインは `1`、素のシェルは `0` で始まり、`POST /api/restart-agent` 成功ごとに 1 増加 |
 | `lastLines` | 最近の出力テキスト（ANSI除去済み、最大15行） |
 | `backgroundAgents` | そのペインでバックグラウンドに動いている Claude Code サブエージェント数（issue #340）。画面末尾のフッター表示（`← N agents` 等）から判定した整数（0 以上）、または判定できないときは `null`（不明）。`0` と `null` は区別されており、`null` は「フッターが読み取れる Claude Code の画面ではない」等の判定不能を表す（バックグラウンドで動くサブエージェントが無いことが確定した状態は `0`）。ペイン幅が狭くフッター表示が `…` で截断され、agents 表示の有無を確認しきれない場合も `0` と断定せず `null` になる。サブエージェントが終了すると `0` に戻る。司令塔（vk-orchestrator）はこの値が `null` のときは、従来どおり `lastOutputTime` だけでペインの稼働を判定する想定 |
 
@@ -867,6 +869,40 @@ curl -s -X POST http://127.0.0.1:13847/api/new-pane \
 - ウィンドウが利用できない: `503 {"error": "window not available"}`
 - タイムアウト（15秒）: `504 {"error": "timeout waiting for new pane"}`
 - renderer 側でペイン作成に失敗（既存ペインなし／分割失敗など）: `500 {"error": "<renderer からのエラーメッセージ>"}`
+
+#### `POST /api/restart-agent`
+
+ペインを閉じずに、ログインシェル配下で動く AI だけを停止確認して起動し直します。別タスクへ入れ替わったペインを誤って止めないよう、直前の `GET /api/states` で得た `agentGeneration` を必ず指定します。
+
+```bash
+curl -s -X POST http://127.0.0.1:13847/api/restart-agent \
+  -H 'Authorization: Bearer <アクセストークン>' \
+  -H 'Content-Type: application/json' \
+  -d '{"termId":"1","expectedGeneration":1,"cwd":"/Users/you/project","engine":"claude","model":"sonnet"}'
+# => {"ok":true,"termId":"1","stopped":true,"generation":2}
+```
+
+リクエストボディ:
+
+- `termId`：対象のターミナル ID（必須）。
+- `expectedGeneration`：呼び出し元が認識している現在の世代番号（必須、0 以上の整数）。現在値と一致しない場合は何も停止・起動せず `409` を返します。
+- `cwd`：再起動後の作業ディレクトリ（任意）。省略時は現在のディレクトリを維持します。存在するディレクトリだけを指定できます。
+- `engine`：`"claude"` / `"codex"`（任意、省略時は `"claude"`）。
+- `model`：選択エンジンへ渡すモデル名（任意）。検証規則は `POST /api/new-pane` と同じです。
+
+レスポンス:
+
+- 成功時: `200 {"ok":true,"termId":"<ID>","stopped":true,"generation":<次の世代>}`
+- JSON・必須値・`engine`・`model`・`cwd` が不正: `400 {"error":"<理由>"}`
+- Origin が不正: `403 {"error":"forbidden origin"}`
+- 指定ペインが存在しない: `404 {"error":"terminal <id> not found"}`
+- 世代が一致しない: `409 {"error":"generation mismatch","currentGeneration":<現在の世代>}`
+- 子プロセスの停止を確認できない: `500 {"error":"failed to stop agent"}`（`SIGKILL` まで送った後でも消滅を確認できなかった場合を含みます。この場合「何も起きなかった」わけではなく、対象ペインの AI が停止した状態のまま残っている可能性があるため、呼び出し元は再試行や状態確認を行ってください）
+- 同一ペインへの先行リクエストの完了待ちが 15 秒を超えた: `504 {"error":"timeout waiting for previous restart-agent operation"}`（同じ `termId` への要求は完全に一列に直列化されるため、先行する要求が積み重なっていると待ち時間が伸びます。このリクエスト自身は何も停止・起動しておらず、世代も進んでいません）
+
+停止時はまず `SIGTERM` を送り、猶予後も残る子孫プロセスには `SIGKILL` を送ります。ログインシェル配下のすべての子孫プロセスが対象になるため、そのペインで手動起動した `npm run dev` 等の常駐プロセスも停止します。PTY のログインシェル自身は停止せず、対象 PID が実際に消えたことを確認してから新しい AI を起動します。Windows ではこの操作に対応していません。
+
+新しい `cwd` が初めて開くディレクトリの場合、起動し直した AI にも信頼確認プロンプトが出ることがあります。この画面には、ペイン新規作成時と同じ自動応答（既定では再起動から 30 秒以内、かつ起動完了検知から 3 秒以内）が効きます。起点は「ペインを作成した時刻」ではなく「この API で再起動した時刻」です。
 
 #### `POST /api/close-pane`
 
