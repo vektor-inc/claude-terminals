@@ -41,6 +41,8 @@ function mergeAgentGenerations(states, getGeneration) {
 
 // HTTP 入力はペインへ触る前にまとめて検証する。engine / model の正は既存関数を注入し、
 // この API 専用の許可ルールを二重に持たない。
+// cwd はここでは形式（文字列・制御文字なし）だけを見る同期チェックに留める。
+// 実在確認（stat）は非同期になるため、この関数の戻り値を見た呼び出し側で別途行う。
 function validateRestartAgentRequest(value, validators) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { ok: false, error: 'termId required' };
@@ -65,9 +67,8 @@ function validateRestartAgentRequest(value, validators) {
     if (typeof value.cwd !== 'string' || !value.cwd || /[\x00-\x1f\x7f]/.test(value.cwd)) {
       return { ok: false, error: 'invalid cwd' };
     }
-    if (validators.isValidCwd && !validators.isValidCwd(value.cwd)) {
-      return { ok: false, error: 'invalid cwd' };
-    }
+    // 実在確認（fs.promises.stat）は非同期のため、ここでは行わない。
+    // 呼び出し側が ok: true を確認した後、cwd が undefined でなければ別途 await で確認すること。
   }
 
   return {
@@ -131,17 +132,13 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// 同じペインの先行処理が終わるたびに Map を読み直し、待機中の後続処理同士も直列化する。
-async function waitForRestartAgentOperation(operations, termId) {
-  let previousOperation;
-  while ((previousOperation = operations.get(termId))) {
-    try {
-      await previousOperation;
-    } catch (_error) {
-      // 先行処理の成否にかかわらず、Map の最新状態を再照合する。
-    }
-  }
-}
+// 直列化の待機ループ（Map を読み直しながら先行処理を待つ while）は、呼び出し側の
+// スコープに直接書くこと。ここに独立した async 関数として切り出すと、while を抜けて
+// からこの関数の呼び出し元へ制御が戻るまでに 1 microtask 分の隙間ができ、その隙間で
+// 複数の待機者が同時に「Map が空」と誤認して並走できてしまう（実際に発生することを
+// 確認済み。詳細は main.js の /api/restart-agent ハンドラのコメントを参照）。
+// そのため、この直列化ロジックはユーティリティ関数として export せず、呼び出し側
+// （main.js）にインラインで持たせている。
 
 // PTY のログインシェル自身は対象にせず、その配下に存在した全 PID の消滅を確認する。
 // 親の終了で孤児化した子も見失わないよう、観測済み PID は完了まで追跡し続ける。
@@ -211,6 +208,5 @@ module.exports = {
   collectDescendantPids,
   stopSignalForElapsed,
   quoteShellArgument,
-  waitForRestartAgentOperation,
   stopAgentChildren,
 };

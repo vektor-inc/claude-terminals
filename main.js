@@ -56,7 +56,6 @@ const {
   mergeAgentGenerations,
   validateRestartAgentRequest,
   quoteShellArgument,
-  waitForRestartAgentOperation,
   stopAgentChildren,
 } = require('./utils/restartAgent');
 const { resolveInstanceId, buildHealthResponse } = require('./utils/instanceId');
@@ -2567,71 +2566,91 @@ function startHttpApi() {
         return;
       }
       readJsonBody(req, res, 10 * 1024, async (body) => {
-        let parsed;
+        // ここで捕まえられない例外は unhandled rejection になり、Node 20 以降の既定では
+        // プロセスごと落ちてしまう。想定外の分岐も 500 で返せるよう全体を try で囲む。
         try {
-          parsed = JSON.parse(body);
-        } catch (_error) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'invalid JSON' }));
-          return;
-        }
-
-        const request = validateRestartAgentRequest(parsed, {
-          isValidEngine,
-          isValidModelForEngine,
-          isValidCwd: isExistingDirectory,
-        });
-        if (!request.ok) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: request.error }));
-          return;
-        }
-
-        // 同じ世代を指定した並行要求が来た場合、先行要求を待ってから再照合する。
-        // 待たずに両方を開始すると、後発要求が先発要求で起動した AI まで停止してしまう。
-        const previousOperation = restartAgentOperations.get(request.termId);
-        if (previousOperation) {
-          try { await previousOperation; } catch (_error) {}
-        }
-
-        const ptyProcess = ptys.get(request.termId);
-        if (!ptyProcess) {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `terminal ${request.termId} not found` }));
-          return;
-        }
-        const currentGeneration = agentGenerations.get(request.termId);
-        if (request.expectedGeneration !== currentGeneration) {
-          res.writeHead(409, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'generation mismatch', currentGeneration }));
-          return;
-        }
-
-        const operation = restartAgentInTerminal(ptyProcess, request);
-        restartAgentOperations.set(request.termId, operation);
-        try {
-          const stopped = await operation;
-          // 停止中に PTY 自体が終了した場合も成功扱いにはせず、世代を進めない。
-          if (!stopped || ptys.get(request.termId) !== ptyProcess) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'failed to stop agent' }));
+          let parsed;
+          try {
+            parsed = JSON.parse(body);
+          } catch (_error) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid JSON' }));
             return;
           }
-          const generation = agentGenerations.increment(request.termId);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            ok: true,
-            termId: request.termId,
-            stopped: true,
-            generation,
-          }));
+
+          const request = validateRestartAgentRequest(parsed, {
+            isValidEngine,
+            isValidModelForEngine,
+          });
+          if (!request.ok) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: request.error }));
+            return;
+          }
+          // cwd の実在確認は fs.promises.stat を使う非同期処理のため、同期の
+          // validateRestartAgentRequest では行わずここで await する。
+          if (request.cwd !== undefined && !(await isExistingDirectory(request.cwd))) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid cwd' }));
+            return;
+          }
+
+          // 同じペインへの並行要求が来た場合、先行処理が終わるたびに Map を読み直して待つ。
+          // 1回だけ待つ形だと、同じ先行処理にぶら下がった2件目以降が互いを認識できず、後発が
+          // 先発の起動した AI を停止してしまう。while ループは呼び出し側（このスコープ）に
+          // 直接置くこと。while ループ自体を別の async 関数へ切り出すと、ループを抜けてから
+          // 呼び出し元へ制御が戻るまでに 1 microtask 分の隙間ができ、その隙間で複数の待機者が
+          // 同時に「Map が空」と誤認する余地が生まれる（実際に発生することを確認済み）。
+          let previousOperation;
+          while ((previousOperation = restartAgentOperations.get(request.termId))) {
+            try { await previousOperation; } catch (_error) {}
+          }
+
+          const ptyProcess = ptys.get(request.termId);
+          if (!ptyProcess) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `terminal ${request.termId} not found` }));
+            return;
+          }
+          const currentGeneration = agentGenerations.get(request.termId);
+          if (request.expectedGeneration !== currentGeneration) {
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'generation mismatch', currentGeneration }));
+            return;
+          }
+
+          const operation = restartAgentInTerminal(ptyProcess, request);
+          restartAgentOperations.set(request.termId, operation);
+          try {
+            const stopped = await operation;
+            // 停止中に PTY 自体が終了した場合も成功扱いにはせず、世代を進めない。
+            if (!stopped || ptys.get(request.termId) !== ptyProcess) {
+              res.writeHead(500, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'failed to stop agent' }));
+              return;
+            }
+            const generation = agentGenerations.increment(request.termId);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true,
+              termId: request.termId,
+              stopped: true,
+              generation,
+            }));
+          } catch (error) {
+            console.error(`${LOG_PREFIX} restart-agent failed for terminal ${request.termId}:`, error.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'failed to stop agent' }));
+          } finally {
+            if (restartAgentOperations.get(request.termId) === operation) {
+              restartAgentOperations.delete(request.termId);
+            }
+          }
         } catch (error) {
-          console.error(`${LOG_PREFIX} restart-agent failed for terminal ${request.termId}:`, error.message);
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'failed to stop agent' }));
-        } finally {
-          if (restartAgentOperations.get(request.termId) === operation) {
-            restartAgentOperations.delete(request.termId);
+          console.error(`${LOG_PREFIX} restart-agent unexpected error:`, error?.message || error);
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'failed to stop agent' }));
           }
         }
       });

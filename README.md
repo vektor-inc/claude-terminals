@@ -897,9 +897,9 @@ curl -s -X POST http://127.0.0.1:13847/api/restart-agent \
 - Origin が不正: `403 {"error":"forbidden origin"}`
 - 指定ペインが存在しない: `404 {"error":"terminal <id> not found"}`
 - 世代が一致しない: `409 {"error":"generation mismatch","currentGeneration":<現在の世代>}`
-- 子プロセスの停止を確認できない: `500 {"error":"failed to stop agent"}`
+- 子プロセスの停止を確認できない: `500 {"error":"failed to stop agent"}`（`SIGKILL` まで送った後でも消滅を確認できなかった場合を含みます。この場合「何も起きなかった」わけではなく、対象ペインの AI が停止した状態のまま残っている可能性があるため、呼び出し元は再試行や状態確認を行ってください）
 
-停止時はまず `SIGTERM` を送り、猶予後も残る子孫プロセスには `SIGKILL` を送ります。PTY のログインシェル自身は停止せず、対象 PID が実際に消えたことを確認してから新しい AI を起動します。Windows ではこの操作に対応していません。
+停止時はまず `SIGTERM` を送り、猶予後も残る子孫プロセスには `SIGKILL` を送ります。ログインシェル配下のすべての子孫プロセスが対象になるため、そのペインで手動起動した `npm run dev` 等の常駐プロセスも停止します。PTY のログインシェル自身は停止せず、対象 PID が実際に消えたことを確認してから新しい AI を起動します。Windows ではこの操作に対応していません。
 
 #### `POST /api/close-pane`
 
