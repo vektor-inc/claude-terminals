@@ -18,6 +18,11 @@ const {
   READY_GRACE_MS: DEFAULT_READY_GRACE_MS,
   resolvePositiveFiniteMs,
 } = require('./utils/trustPromptGate');
+// 信頼確認プロンプトへの自動応答を、ペイン作成時（terminal:create）と再起動時
+// （POST /api/restart-agent）の両方から同じ判定で使うための共通配線（issue #392）。
+// getReadyPatternForEngine は「起動完了検知」の正規表現選択、attachTrustAutoResponder は
+// pty の出力を読んで trustPromptGate へ渡し、許可されたときだけ Enter を書き込む監視。
+const { getReadyPatternForEngine, attachTrustAutoResponder } = require('./utils/trustPromptWatcher');
 // 宣言的ウィジェット（tasks-widget.json）契約の共有ロジック（#229 / vk-orchestrator#182）。
 // タスクのドメイン語彙（遷移マトリクス・ラベル・優先度など）はこのプロセスに持たず、
 // orchestrator が書き出す宣言を検証・中継するだけの汎用実装にする。
@@ -97,6 +102,12 @@ const agentGenerations = createAgentGenerationStore();
 // 同じペインへの同時再起動は先行処理の完了後に世代を再照合する。
 // これが無いと同じ expectedGeneration の2要求が両方通り、後発が先発の新しい AI を止めうる。
 const restartAgentOperations = new Map();
+// 再起動後の信頼確認プロンプト自動応答（issue #392）の監視を termId ごとに保持する。
+// 同じペインへ短時間に複数回 restart-agent が呼ばれた場合、古い監視を残したままにすると
+// 新しい監視と時間窓が重なり、同じプロンプトに Enter を二重送信しうるため、次の再起動を
+// 開始する前に前回分を確実に解除する（restartAgentOperations の直列化により、同じ termId
+// への呼び出しはこの Map への set/get も含めて重ならない）。
+const restartTrustResponders = new Map();
 // 直列化の待ち行列に積まれたまま応答が返らない状態を避けるための、リクエスト単位の上限。
 // /api/new-pane の待機タイムアウトと揃えている。
 const RESTART_AGENT_QUEUE_TIMEOUT_MS = 15000;
@@ -1389,21 +1400,11 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
   // 想定より早く送られてしまう。resolvedEngine ごとに別パターンを使うことで、
   // Claude ペインには従来どおり CLAUDE_READY_PATTERN だけを適用する。
   //
-  // 三項演算子で分岐する（安藤の指摘 LOW・修正1）: 当初はオブジェクトマップ
-  // （{ claude: ..., codex: ... }）で分けていたが、これは renderer/claudeModel.js の
-  // ENGINE_LAUNCH_COMMANDS で今まさに塞いだのと同じ「素のオブジェクトリテラルへの
-  // 変数添字アクセス」だった。resolvedEngine は isValidEngine 済みで到達不能とはいえ、
-  // 仮に未検証の値が来ると Object.prototype 側のメンバー（関数）が返り、
-  // READY_PATTERN.test(buffer) が ptyProcess.onData のたびに TypeError を投げる
-  // （安藤の実測）。エンジンが 'claude' / 'codex' の2つしか無い現状では、素のオブジェクト
-  // アクセスを経由しない三項演算子の方が安全かつ素直。3つ目以降のエンジンを足す際は
-  // ここを見直すこと（未登録の engine は CLAUDE_READY_PATTERN へ倒れる＝安全側）。
-  const CLAUDE_READY_PATTERN = /\?\s*for\s*shortcuts|\?\s*to\s*show\s*shortcuts|for\s*shortcuts|Welcome to Claude|Try\s*["']?\/help|Bypass(ing)?\s*Permissions|accept edits/i;
-  // Codex（issue #367。codex-cli 0.147.0 実機確認）: 起動完了バナーに "OpenAI Codex" が
-  // 出る。vk-orchestrator 側の CODEX_READY_PATTERN（setup-entry-autostart.js）と同じ
-  // パターンを採用する。
-  const CODEX_READY_PATTERN = /OpenAI Codex/i;
-  const READY_PATTERN = resolvedEngine === 'codex' ? CODEX_READY_PATTERN : CLAUDE_READY_PATTERN;
+  // パターン自体の選択は utils/trustPromptWatcher.js の getReadyPatternForEngine へ
+  // 切り出した（issue #392）。POST /api/restart-agent 経由の再起動でも同じ「起動完了検知」
+  // 判定を使うため、ここと再起動側の2箇所に同じ選択ロジックを別々に持たないようにする
+  // （選択ルールの詳細・安全側の既定はそちらのコメント参照）。
+  const READY_PATTERN = getReadyPatternForEngine(resolvedEngine);
 
   const WATCH_TIMEOUT_MS = 10000;
 
@@ -1573,6 +1574,10 @@ ipcMain.handle('terminal:create', (event, cwd, options = {}) => {
     ptys.delete(id);
     agentGenerations.delete(id);
     restartAgentOperations.delete(id);
+    // 再起動後の信頼確認プロンプト自動応答（issue #392）が残っていれば解除する。
+    const restartTrustResponder = restartTrustResponders.get(id);
+    if (restartTrustResponder) restartTrustResponder.dispose();
+    restartTrustResponders.delete(id);
     if (win && !win.isDestroyed()) {
       win.webContents.send('terminal:exit', id);
     }
@@ -1735,6 +1740,34 @@ async function restartAgentInTerminal(ptyProcess, request) {
     killProcess: (pid, signal) => process.kill(pid, signal),
   });
   if (!stopped) return false;
+
+  // 再起動後の AI にも、ペイン作成時（terminal:create）と同じ信頼確認プロンプト自動応答を
+  // 効かせる（issue #392 の追加対応。安藤の指摘・HIGH）。この仕組みが無いと、cwd を
+  // 初めて開くディレクトリへ切り替えて再起動した場合に、新しい AI が信頼確認画面で
+  // 静止したまま止まりうる。起点時刻（spawnTime）は「ペイン作成時刻」ではなく
+  // 「再起動した時刻」を使う。ここを終始 performance.now()（単調増加時計）にする理由は
+  // terminal:create の spawnTime と同じ（システム時刻の巻き戻りで時間窓が開きっぱなしに
+  // なるのを防ぐため）。
+  //
+  // 判定ロジック（時間窓・ready 猶予・isTrustPrompt）は utils/trustPromptGate.js を
+  // そのまま再利用しており（utils/trustPromptWatcher.js 経由）、ここで作り直していない。
+  //
+  // 同じペインへ短時間に複数回再起動された場合に古い監視が新しい監視と重なって同じ
+  // プロンプトへ Enter を二重送信しないよう、新しい監視を取り付ける前に前回分を解除する
+  // （restartAgentOperations による直列化で、同じ termId の呼び出しはここへ到達する時点で
+  // 前回の restartAgentInTerminal が完了済みであることが保証されている）。
+  const previousTrustResponder = restartTrustResponders.get(request.termId);
+  if (previousTrustResponder) previousTrustResponder.dispose();
+  const restartSpawnTime = performance.now();
+  const trustResponder = attachTrustAutoResponder(ptyProcess, {
+    spawnTime: restartSpawnTime,
+    engine: request.engine,
+    trustWindowMs: RESOLVED_TRUST_WINDOW_MS,
+    readyGraceMs: RESOLVED_READY_GRACE_MS,
+    isAlive: () => ptys.get(request.termId) === ptyProcess,
+    log: (message) => console.log(`${LOG_PREFIX} ${message} (terminal ${request.termId})`),
+  });
+  restartTrustResponders.set(request.termId, trustResponder);
 
   // cwd は制御文字を拒否して存在確認済みでも、この write までに名前が変わる可能性がある。
   // 残る通常文字は `cd --` と単一引数クォートで一つの引数として扱う。
