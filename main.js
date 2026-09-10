@@ -56,6 +56,7 @@ const {
   mergeAgentGenerations,
   validateRestartAgentRequest,
   quoteShellArgument,
+  waitForRestartAgentOperation,
   stopAgentChildren,
 } = require('./utils/restartAgent');
 const { resolveInstanceId, buildHealthResponse } = require('./utils/instanceId');
@@ -1702,10 +1703,12 @@ ipcMain.on('terminal:report-states', (event, states) => {
   fs.writeFile(STATE_FILE, payload, 'utf8', () => {});
 });
 
-function isExistingDirectory(value) {
+async function isExistingDirectory(value) {
   if (typeof value !== 'string' || !value) return false;
+  // PTY への write はキーストロークとして解釈されるため、制御文字はクォートへ渡さない。
+  if (/[\x00-\x1f\x7f]/.test(value)) return false;
   try {
-    return fs.statSync(value).isDirectory();
+    return (await fs.promises.stat(value)).isDirectory();
   } catch (_error) {
     return false;
   }
@@ -1714,7 +1717,11 @@ function isExistingDirectory(value) {
 async function listProcessesForRestart() {
   // `ps` の引数は macOS / Linux の両方で利用できる共通部分に限定する。
   // shell 経由では起動せず、外部入力がコマンドとして解釈される経路を作らない。
-  const { stdout } = await execFileAsync('ps', ['-A', '-o', 'pid=,ppid='], { maxBuffer: 1024 * 1024 });
+  const { stdout } = await execFileAsync('ps', ['-A', '-o', 'pid=,ppid='], {
+    maxBuffer: 1024 * 1024,
+    timeout: 2000,
+    killSignal: 'SIGKILL',
+  });
   return stdout;
 }
 
@@ -1726,8 +1733,8 @@ async function restartAgentInTerminal(ptyProcess, request) {
   });
   if (!stopped) return false;
 
-  // cwd は存在確認済みでも、この write までに名前が変わる可能性がある。
-  // `cd --` と単一引数クォートで解釈を固定し、失敗時にも別コマンドを注入させない。
+  // cwd は制御文字を拒否して存在確認済みでも、この write までに名前が変わる可能性がある。
+  // 残る通常文字は `cd --` と単一引数クォートで一つの引数として扱う。
   if (request.cwd !== undefined) {
     ptyProcess.write(`cd -- ${quoteShellArgument(request.cwd)}\r`);
   }

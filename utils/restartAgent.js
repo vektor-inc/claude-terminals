@@ -45,7 +45,8 @@ function validateRestartAgentRequest(value, validators) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { ok: false, error: 'termId required' };
   }
-  if (value.termId === undefined || value.termId === null || String(value.termId) === '') {
+  const termIdType = typeof value.termId;
+  if ((termIdType !== 'string' && termIdType !== 'number') || String(value.termId) === '') {
     return { ok: false, error: 'termId required' };
   }
   if (!Number.isSafeInteger(value.expectedGeneration) || value.expectedGeneration < 0) {
@@ -59,8 +60,14 @@ function validateRestartAgentRequest(value, validators) {
   if (value.model !== undefined && !validators.isValidModelForEngine(engine, value.model)) {
     return { ok: false, error: 'invalid model' };
   }
-  if (value.cwd !== undefined && !validators.isValidCwd(value.cwd)) {
-    return { ok: false, error: 'invalid cwd' };
+  if (value.cwd !== undefined) {
+    // PTY への write はキーストロークとして扱われるため、制御文字はクォートに渡さない。
+    if (typeof value.cwd !== 'string' || !value.cwd || /[\x00-\x1f\x7f]/.test(value.cwd)) {
+      return { ok: false, error: 'invalid cwd' };
+    }
+    if (validators.isValidCwd && !validators.isValidCwd(value.cwd)) {
+      return { ok: false, error: 'invalid cwd' };
+    }
   }
 
   return {
@@ -73,25 +80,30 @@ function validateRestartAgentRequest(value, validators) {
   };
 }
 
-// ps の pid/ppid 一覧を、親 PID から直接の子 PID を引ける Map に変換する。
+// ps の pid/ppid 一覧を、子孫探索・親の再照合・生存確認に使う索引へ変換する。
 function parseProcessTable(output) {
   const childrenByParent = new Map();
+  const parentByPid = new Map();
+  const livePids = new Set();
   for (const line of String(output).split('\n')) {
     const match = line.trim().match(/^(\d+)\s+(\d+)$/);
     if (!match) continue;
     const pid = Number(match[1]);
     const parentPid = Number(match[2]);
+    livePids.add(pid);
+    parentByPid.set(pid, parentPid);
     const children = childrenByParent.get(parentPid) || [];
     children.push(pid);
     childrenByParent.set(parentPid, children);
   }
-  return childrenByParent;
+  return { childrenByParent, parentByPid, livePids };
 }
 
 function collectDescendantPids(rootPid, childrenByParent) {
+  const root = Number(rootPid);
   const descendants = [];
-  const pending = [...(childrenByParent.get(Number(rootPid)) || [])];
-  const seen = new Set();
+  const pending = [...(childrenByParent.get(root) || [])];
+  const seen = new Set([root]);
   while (pending.length > 0) {
     const pid = pending.pop();
     if (seen.has(pid)) continue;
@@ -106,7 +118,11 @@ function stopSignalForElapsed(elapsedMs, termGraceMs = DEFAULT_TERM_GRACE_MS) {
   return elapsedMs < termGraceMs ? TERM_SIGNAL : KILL_SIGNAL;
 }
 
-// POSIX シェルの単一引数として安全に渡せるよう、シングルクォートを閉じて再開する。
+/**
+ * 値を POSIX シェルの単一引数としてクォートする。
+ * この関数は POSIX のクォートだけを担う。PTY への write で制御文字を無害化する責任は
+ * 呼び出し側の入力検証にある。
+ */
 function quoteShellArgument(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -115,36 +131,65 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// 同じペインの先行処理が終わるたびに Map を読み直し、待機中の後続処理同士も直列化する。
+async function waitForRestartAgentOperation(operations, termId) {
+  let previousOperation;
+  while ((previousOperation = operations.get(termId))) {
+    try {
+      await previousOperation;
+    } catch (_error) {
+      // 先行処理の成否にかかわらず、Map の最新状態を再照合する。
+    }
+  }
+}
+
 // PTY のログインシェル自身は対象にせず、その配下に存在した全 PID の消滅を確認する。
 // 親の終了で孤児化した子も見失わないよう、観測済み PID は完了まで追跡し続ける。
 async function stopAgentChildren(shellPid, dependencies, options = {}) {
   if (dependencies.platform === 'win32') {
     throw new Error('restart-agent is not supported on Windows');
   }
+  const rootPid = Number(shellPid);
+  // 0 / 1 は広範なプロセスを対象にしうるため、PTY シェルの PID として受け付けない。
+  if (!Number.isInteger(rootPid) || rootPid <= 1) {
+    throw new Error(`invalid shell pid: ${shellPid}`);
+  }
   const termGraceMs = options.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const now = dependencies.now || Date.now;
   const wait = dependencies.wait || delay;
-  const targets = new Set();
+  // PID 再利用を見分けられるよう、初回発見時の親 PID も保持する。
+  const targets = new Map();
   const startedAt = now();
 
   while (true) {
-    const processTable = parseProcessTable(await dependencies.listProcesses());
-    for (const pid of collectDescendantPids(shellPid, processTable)) targets.add(pid);
-
-    const livePids = new Set();
-    for (const pids of processTable.values()) {
-      for (const pid of pids) livePids.add(pid);
+    const { childrenByParent, parentByPid, livePids } = parseProcessTable(
+      await dependencies.listProcesses()
+    );
+    for (const pid of collectDescendantPids(rootPid, childrenByParent)) {
+      if (!targets.has(pid)) targets.set(pid, parentByPid.get(pid));
     }
-    const remaining = [...targets].filter((pid) => livePids.has(pid));
+
+    // シェルが見えない初回結果はプロセス表を信用せず、停止成功にはしない。
+    // 追跡開始後に見えなくなった場合は、ペイン自体が終了したものとして失敗させる。
+    if (!livePids.has(rootPid)) {
+      if (targets.size === 0) throw new Error('failed to read process table');
+      return false;
+    }
+
+    const remaining = [...targets.keys()].filter((pid) => {
+      if (!livePids.has(pid)) return false;
+      const currentParent = parentByPid.get(pid);
+      return currentParent === targets.get(pid) || targets.has(currentParent) || currentParent === 1;
+    });
     if (remaining.length === 0) return true;
 
     const elapsedMs = now() - startedAt;
     if (elapsedMs >= timeoutMs) return false;
     const signal = stopSignalForElapsed(elapsedMs, termGraceMs);
-    // 子から先に止めると、親が終了処理中に新しい孫を作る時間を減らせる。
-    for (const pid of remaining.reverse()) {
+    // 親子の停止順は保証せず、各ポーリングで残っている追跡対象へ同じ信号を送る。
+    for (const pid of remaining) {
       try {
         dependencies.killProcess(pid, signal);
       } catch (error) {
@@ -166,5 +211,6 @@ module.exports = {
   collectDescendantPids,
   stopSignalForElapsed,
   quoteShellArgument,
+  waitForRestartAgentOperation,
   stopAgentChildren,
 };
