@@ -89,8 +89,13 @@ test('restart-agent 検証: 不正値をペイン操作前に拒否する', () =
   }
 });
 
+// 以下のテストで使う ps 出力は `pid ppid lstart` の3列。lstart は日時としては解釈されず、
+// 同一プロセスかどうかを見分けるための不透明な識別子として使われるため、テストでは
+// "T0" / "T1" のような単純なプレースホルダで代用する。
 test('プロセス表: PTY シェル配下の全子孫だけを列挙する', () => {
-  const { childrenByParent } = parseProcessTable('  10     1\n  20    10\n  30    20\n  40     1\ninvalid\n');
+  const { childrenByParent } = parseProcessTable(
+    '  10     1  T0\n  20    10  T0\n  30    20  T0\n  40     1  T0\ninvalid\n'
+  );
   assert.deepEqual(new Set(collectDescendantPids(10, childrenByParent)), new Set([20, 30]));
   assert.equal(collectDescendantPids(10, childrenByParent).includes(10), false);
   assert.equal(collectDescendantPids(10, childrenByParent).includes(40), false);
@@ -112,10 +117,10 @@ test('子プロセス停止: SIGTERM 後に残る PID を SIGKILL へ上げ、�
   let reads = 0;
   const signals = [];
   const processTables = [
-    '10 1\n20 10\n30 20\n',
-    '10 1\n20 10\n30 20\n',
-    '10 1\n20 10\n30 20\n',
-    '10 1\n',
+    '10 1 T0\n20 10 T0\n30 20 T0\n',
+    '10 1 T0\n20 10 T0\n30 20 T0\n',
+    '10 1 T0\n20 10 T0\n30 20 T0\n',
+    '10 1 T0\n',
   ];
   const stopped = await stopAgentChildren(10, {
     platform: 'darwin',
@@ -137,7 +142,7 @@ test('子プロセス停止: 全体タイムアウトでは false を返し、Wi
     platform: 'linux',
     now: () => clock,
     wait: async (ms) => { clock += ms; },
-    listProcesses: async () => '10 1\n20 10\n',
+    listProcesses: async () => '10 1 T0\n20 10 T0\n',
     killProcess: () => {},
   }, { termGraceMs: 10, timeoutMs: 20, pollIntervalMs: 10 });
   assert.equal(stopped, false);
@@ -152,7 +157,7 @@ test('子プロセス停止: 全体タイムアウトでは false を返し、Wi
 test('子プロセス停止: shellPid が 0 / 非整数のときは fail-closed で throw する', async () => {
   const dependencies = {
     platform: 'darwin',
-    listProcesses: async () => '10 1\n',
+    listProcesses: async () => '10 1 T0\n',
     killProcess: () => {},
   };
   await assert.rejects(() => stopAgentChildren(0, dependencies), /invalid shell pid/);
@@ -180,24 +185,29 @@ test('子プロセス停止: ps が空／書式違いの出力しか返さない
 
 test('プロセス表: 循環する親子関係を与えても root（シェル自身）は子孫に含まれない', () => {
   // 20 の「子」として誤って root(10) が記録されている壊れたプロセス表を模す。
-  const table = parseProcessTable('10 1\n20 10\n30 20\n');
+  const table = parseProcessTable('10 1 T0\n20 10 T0\n30 20 T0\n');
   table.childrenByParent.set(20, [...(table.childrenByParent.get(20) || []), 10]);
   const descendants = collectDescendantPids(10, table.childrenByParent);
   assert.equal(descendants.includes(10), false);
   assert.deepEqual(new Set(descendants), new Set([20, 30]));
 });
 
-test('子プロセス停止: PID 再利用（発見時と親 PID が変わった PID）は kill 対象から外れる', async () => {
+// PID の同一性は「PID + 起動時刻（lstart）」で判定する（親 PID の一致や、決め打ちの
+// reaper PID には頼らない）。以下2本は、その判定が「起動時刻が変わった＝別プロセス」
+// と「起動時刻が同じ＝同一プロセス（親が変わっただけ）」を正しく区別できることを確認する。
+
+test('子プロセス停止: PID 再利用（発見時と起動時刻が変わった PID）は kill 対象から外れる', async () => {
   let reads = 0;
   let clock = 0;
   const signals = [];
-  // 1 回目: pid 20 は shell(10) の子として発見され、その場で SIGTERM が送られる。
-  // 2 回目以降: pid 20 は無関係な親(999)の子として存在し続ける（= 別プロセスに再利用された）。
-  // 時計は猶予を超えて進めるが、再利用後の pid 20 は SIGKILL まで送られてはいけない。
+  // 1 回目: pid 20（起動時刻 T0）は shell(10) の子として発見され、その場で SIGTERM が送られる。
+  // 2 回目以降: pid 20 はまだ存在するが起動時刻が T1 に変わっている（= 元のプロセスは終了し、
+  // OS が同じ PID を無関係な別プロセスへ再利用した）。親 PID は変わっていなくても、
+  // 起動時刻が一致しない以上、以後は追跡対象から外れなければならない。
   const processTables = [
-    '10 1\n20 10\n',
-    '10 1\n20 999\n999 1\n',
-    '10 1\n20 999\n999 1\n',
+    '10 1 T0\n20 10 T0\n',
+    '10 1 T0\n20 10 T1\n',
+    '10 1 T0\n20 10 T1\n',
   ];
   const stopped = await stopAgentChildren(10, {
     platform: 'darwin',
@@ -211,6 +221,38 @@ test('子プロセス停止: PID 再利用（発見時と親 PID が変わった
   const signalsToPid20 = signals.filter(([pid]) => pid === 20);
   assert.equal(signalsToPid20.length, 1);
   assert.equal(signalsToPid20[0][1], 'SIGTERM');
+});
+
+test('子プロセス停止: 起動時刻が同じまま孤児化（親だけ変化）した場合は、reaper の PID が 1 でなくても追跡を続ける', async () => {
+  let reads = 0;
+  let clock = 0;
+  const signals = [];
+  // pid 20（起動時刻 T0）は shell(10) の子として発見された後、親を失って
+  // reaper（Linux の `systemd --user` セッション等を想定した pid 900。あえて 1 以外にする）
+  // に引き取られる。起動時刻は T0 のまま変わらないため、親 PID が 1 でなくても
+  // 同一プロセスとして追跡・停止を継続し、最終的に消滅を確認できなければならない。
+  const processTables = [
+    '10 1 T0\n20 10 T0\n',
+    '10 1 T0\n20 900 T0\n900 1 T0\n',
+    '10 1 T0\n20 900 T0\n900 1 T0\n',
+    '10 1 T0\n900 1 T0\n',
+  ];
+  const stopped = await stopAgentChildren(10, {
+    platform: 'darwin',
+    now: () => clock,
+    wait: async (ms) => { clock += ms; },
+    listProcesses: async () => processTables[Math.min(reads++, processTables.length - 1)],
+    killProcess: (pid, signal) => signals.push([pid, signal]),
+  }, { termGraceMs: 100, timeoutMs: 300, pollIntervalMs: 50 });
+
+  assert.equal(stopped, true);
+  const signalsToPid20 = signals.filter(([pid]) => pid === 20);
+  // 親が 900（reaper）に変わった後も SIGTERM・SIGKILL が送られ続けていること
+  // （= 親 PID の変化だけで追跡から外れていないこと）を確認する。
+  assert.equal(signalsToPid20.length >= 2, true);
+  assert.equal(signalsToPid20.some(([, signal]) => signal === 'SIGKILL'), true);
+  // reaper 自身（900）は shell の子孫ではないため、kill 対象にならない。
+  assert.equal(signals.some(([pid]) => pid === 900), false);
 });
 
 test('直列化: 同一 termId への3件以上の並行要求は先行処理の完了を待ち、後発が先発の起動を止めない', async () => {
@@ -261,4 +303,53 @@ test('直列化: 同一 termId への3件以上の並行要求は先行処理の
 
   await Promise.all([scheduleRequest('a'), scheduleRequest('b'), scheduleRequest('c')]);
   assert.deepEqual(timeline.map((entry) => entry.id), ['a', 'b', 'c']);
+});
+
+// main.js の /api/restart-agent ハンドラが持つ、待ち行列全体のタイムアウト（504）を
+// そのままの形で再現する。直列化ロジック本体と同じく main.js から export されていないため
+// 再現実装での検証になるが、待ち行列に積まれたまま無期限に待たせないことを確認する。
+async function waitForPreviousOperationWithTimeout(operations, termId, queueTimeoutMs) {
+  const queueDeadline = Date.now() + queueTimeoutMs;
+  let previousOperation;
+  while ((previousOperation = operations.get(termId))) {
+    const remainingMs = queueDeadline - Date.now();
+    if (remainingMs <= 0) {
+      return { timedOut: true };
+    }
+    await Promise.race([
+      previousOperation.catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, remainingMs)),
+    ]);
+  }
+  return { timedOut: false };
+}
+
+test('直列化のキュー待ちタイムアウト: 上限を超えたら打ち切り、世代を進めない結果を返す', async () => {
+  const operations = new Map();
+  // タイムアウトの上限より確実に長く先行処理を保留させておく。
+  let releasePrevious;
+  const previousOperation = new Promise((resolve) => { releasePrevious = resolve; });
+  operations.set('term-1', previousOperation);
+
+  const result = await waitForPreviousOperationWithTimeout(operations, 'term-1', 30);
+  assert.equal(result.timedOut, true);
+
+  // 後片付け: 保留していた先行処理を解放する。
+  releasePrevious();
+  await previousOperation;
+});
+
+test('直列化のキュー待ちタイムアウト: 上限内に先行処理が終われば打ち切らずに進む', async () => {
+  const operations = new Map();
+  let releasePrevious;
+  const previousOperation = new Promise((resolve) => { releasePrevious = resolve; });
+  operations.set('term-1', previousOperation);
+  // 本番の finally 相当: 先行処理が完了したら Map から自分の分を消す。
+  previousOperation.then(() => {
+    if (operations.get('term-1') === previousOperation) operations.delete('term-1');
+  });
+  setTimeout(() => releasePrevious(), 5);
+
+  const result = await waitForPreviousOperationWithTimeout(operations, 'term-1', 1000);
+  assert.equal(result.timedOut, false);
 });

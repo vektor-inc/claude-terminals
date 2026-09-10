@@ -81,23 +81,32 @@ function validateRestartAgentRequest(value, validators) {
   };
 }
 
-// ps の pid/ppid 一覧を、子孫探索・親の再照合・生存確認に使う索引へ変換する。
+// ps の pid/ppid/lstart 一覧を、子孫探索・同一性の再照合・生存確認に使う索引へ変換する。
+// lstart（起動時刻）は、PID が再利用された別プロセスや、孤児化して reaper に引き取られた
+// プロセスを、同じ PID の「同じプロセス」と誤認しないための鍵として使う（parentByPid だけでは
+// 親が変わった理由が「再利用」なのか「孤児化」なのか区別できないため）。
 function parseProcessTable(output) {
   const childrenByParent = new Map();
   const parentByPid = new Map();
   const livePids = new Set();
+  const startedAtByPid = new Map();
   for (const line of String(output).split('\n')) {
-    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+    // lstart は曜日・月・日・時刻・年を含む文字列（例: "Wed Sep 10 18:20:00 2026"）で、
+    // 内部に空白を含むため末尾までまとめて 1 グループとして捉える。日時として解釈せず、
+    // 同一プロセスかどうかを判定する不透明な識別子としてのみ文字列比較に使う。
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
     if (!match) continue;
     const pid = Number(match[1]);
     const parentPid = Number(match[2]);
+    const startedAt = match[3];
     livePids.add(pid);
     parentByPid.set(pid, parentPid);
+    startedAtByPid.set(pid, startedAt);
     const children = childrenByParent.get(parentPid) || [];
     children.push(pid);
     childrenByParent.set(parentPid, children);
   }
-  return { childrenByParent, parentByPid, livePids };
+  return { childrenByParent, parentByPid, livePids, startedAtByPid };
 }
 
 function collectDescendantPids(rootPid, childrenByParent) {
@@ -156,16 +165,21 @@ async function stopAgentChildren(shellPid, dependencies, options = {}) {
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const now = dependencies.now || Date.now;
   const wait = dependencies.wait || delay;
-  // PID 再利用を見分けられるよう、初回発見時の親 PID も保持する。
-  const targets = new Map();
-  const startedAt = now();
+  // PID の同一性は「PID + 起動時刻（lstart）」で判定する。親 PID の一致や固定 PID（1）への
+  // 決め打ちには頼らない。reaper（孤児を引き取るプロセス）の PID は環境によって異なり
+  // （例: Linux の `systemd --user` セッションでは 1 ではなくユーザーマネージャの PID になる）、
+  // 親 PID だけを見ていると「孤児化して reaper に引き取られた既知の子」を「無関係な別プロセス」
+  // と誤認して追跡から外してしまう。起動時刻まで一致していれば、親がどこへ変わっても
+  // 同じプロセスとして追跡を続けてよい。
+  const targets = new Map(); // pid -> 発見時の起動時刻（lstart）
+  const operationStartedAt = now();
 
   while (true) {
-    const { childrenByParent, parentByPid, livePids } = parseProcessTable(
+    const { childrenByParent, livePids, startedAtByPid } = parseProcessTable(
       await dependencies.listProcesses()
     );
     for (const pid of collectDescendantPids(rootPid, childrenByParent)) {
-      if (!targets.has(pid)) targets.set(pid, parentByPid.get(pid));
+      if (!targets.has(pid)) targets.set(pid, startedAtByPid.get(pid));
     }
 
     // シェルが見えない初回結果はプロセス表を信用せず、停止成功にはしない。
@@ -175,14 +189,12 @@ async function stopAgentChildren(shellPid, dependencies, options = {}) {
       return false;
     }
 
-    const remaining = [...targets.keys()].filter((pid) => {
-      if (!livePids.has(pid)) return false;
-      const currentParent = parentByPid.get(pid);
-      return currentParent === targets.get(pid) || targets.has(currentParent) || currentParent === 1;
-    });
+    const remaining = [...targets.keys()].filter((pid) => (
+      livePids.has(pid) && startedAtByPid.get(pid) === targets.get(pid)
+    ));
     if (remaining.length === 0) return true;
 
-    const elapsedMs = now() - startedAt;
+    const elapsedMs = now() - operationStartedAt;
     if (elapsedMs >= timeoutMs) return false;
     const signal = stopSignalForElapsed(elapsedMs, termGraceMs);
     // 親子の停止順は保証せず、各ポーリングで残っている追跡対象へ同じ信号を送る。

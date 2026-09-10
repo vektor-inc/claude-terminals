@@ -97,6 +97,9 @@ const agentGenerations = createAgentGenerationStore();
 // 同じペインへの同時再起動は先行処理の完了後に世代を再照合する。
 // これが無いと同じ expectedGeneration の2要求が両方通り、後発が先発の新しい AI を止めうる。
 const restartAgentOperations = new Map();
+// 直列化の待ち行列に積まれたまま応答が返らない状態を避けるための、リクエスト単位の上限。
+// /api/new-pane の待機タイムアウトと揃えている。
+const RESTART_AGENT_QUEUE_TIMEOUT_MS = 15000;
 let nextId = 1;
 let firstTerminalCreated = false;
 
@@ -1714,9 +1717,10 @@ async function isExistingDirectory(value) {
 }
 
 async function listProcessesForRestart() {
-  // `ps` の引数は macOS / Linux の両方で利用できる共通部分に限定する。
+  // `ps` の引数は macOS / Linux の両方で利用できる共通部分に限定する。lstart（起動時刻）は
+  // PID の同一性判定（utils/restartAgent.js 側で使用）に使う。両 OS の ps で共通に使える。
   // shell 経由では起動せず、外部入力がコマンドとして解釈される経路を作らない。
-  const { stdout } = await execFileAsync('ps', ['-A', '-o', 'pid=,ppid='], {
+  const { stdout } = await execFileAsync('ps', ['-A', '-o', 'pid=,ppid=,lstart='], {
     maxBuffer: 1024 * 1024,
     timeout: 2000,
     killSignal: 'SIGKILL',
@@ -2601,9 +2605,25 @@ function startHttpApi() {
           // 直接置くこと。while ループ自体を別の async 関数へ切り出すと、ループを抜けてから
           // 呼び出し元へ制御が戻るまでに 1 microtask 分の隙間ができ、その隙間で複数の待機者が
           // 同時に「Map が空」と誤認する余地が生まれる（実際に発生することを確認済み）。
+          //
+          // 待ち行列に積まれた件数が増えるほど、末尾のリクエストは先行するすべての処理の
+          // 完了を待つため待ち時間が線形に伸びる。無期限に待たせず、呼び出し元が「詰まった」
+          // ことを検知できるよう、待ち行列全体にリクエスト単位の上限（/api/new-pane と同じ
+          // 秒数）を設ける。タイムアウトで打ち切った場合、このリクエストは何も停止・起動
+          // しておらず世代も進めていないため、そのまま 504 を返して終了してよい。
+          const queueDeadline = Date.now() + RESTART_AGENT_QUEUE_TIMEOUT_MS;
           let previousOperation;
           while ((previousOperation = restartAgentOperations.get(request.termId))) {
-            try { await previousOperation; } catch (_error) {}
+            const remainingMs = queueDeadline - Date.now();
+            if (remainingMs <= 0) {
+              res.writeHead(504, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'timeout waiting for previous restart-agent operation' }));
+              return;
+            }
+            await Promise.race([
+              previousOperation.catch(() => {}),
+              new Promise((resolve) => setTimeout(resolve, remainingMs)),
+            ]);
           }
 
           const ptyProcess = ptys.get(request.termId);
