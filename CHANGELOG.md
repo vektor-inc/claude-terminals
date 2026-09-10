@@ -1,5 +1,7 @@
 # Changelog
 
+## 1.63.0
+
 - [ 機能追加 ] ペインを閉じずに AI の停止完了を確認して起動し直せる HTTP API を追加（実際に使われるのは VK Orchestrator 側の対応が入ってから）（[#392](https://github.com/vektor-inc/vk-terminals/issues/392)）
 
 ## 1.62.1
